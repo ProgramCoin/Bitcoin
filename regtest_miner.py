@@ -13,7 +13,7 @@ DEFAULT_CORE_CLI = Path(
     r"C:\Program Files\Bitcoin\daemon\bitcoin-cli.exe"
 )
 DEFAULT_CUDA_MINER = Path(__file__).with_name("cuda_miner.exe")
-NONCE_LIMIT = 1 << 32
+MAX_MONEY = 21_000_000 * 100_000_000
 WITNESS_COMMITMENT_PREFIX = bytes.fromhex("6a24aa21a9ed")
 RAW_STRING_RPC_METHODS = {
     "getbestblockhash",
@@ -39,6 +39,106 @@ def compact_size(value: int) -> bytes:
     if value <= 0xFFFFFFFF:
         return b"\xfe" + struct.pack("<I", value)
     return b"\xff" + struct.pack("<Q", value)
+
+
+def read_compact_size(data: bytes, offset: int) -> tuple[int, int]:
+    if offset >= len(data):
+        raise ValueError("Truncated CompactSize")
+    prefix = data[offset]
+    offset += 1
+    if prefix < 0xFD:
+        return prefix, offset
+
+    width = {0xFD: 2, 0xFE: 4, 0xFF: 8}[prefix]
+    if offset + width > len(data):
+        raise ValueError("Truncated CompactSize value")
+    value = int.from_bytes(data[offset : offset + width], "little")
+    minimum = {2: 0xFD, 4: 0x10000, 8: 0x100000000}[width]
+    if value < minimum:
+        raise ValueError("Non-canonical CompactSize")
+    return value, offset + width
+
+
+def require_transaction_bytes(
+    data: bytes,
+    offset: int,
+    length: int,
+    field: str,
+) -> int:
+    if length < 0 or offset + length > len(data):
+        raise ValueError(f"Truncated transaction {field}")
+    return offset + length
+
+
+def transaction_hashes(raw_transaction: bytes) -> tuple[bytes, bytes]:
+    if len(raw_transaction) < 10:
+        raise ValueError("Transaction is too short")
+
+    offset = 4
+    has_witness = False
+    if raw_transaction[offset] == 0 and raw_transaction[offset + 1] != 0:
+        if raw_transaction[offset + 1] != 1:
+            raise ValueError("Transaction uses unsupported witness flags")
+        has_witness = True
+        offset += 2
+
+    inputs_start = offset
+    input_count, offset = read_compact_size(raw_transaction, offset)
+    if input_count == 0 or input_count > len(raw_transaction) - offset:
+        raise ValueError("Transaction has an invalid input count")
+    for _ in range(input_count):
+        offset = require_transaction_bytes(
+            raw_transaction, offset, 36, "input outpoint"
+        )
+        script_length, offset = read_compact_size(raw_transaction, offset)
+        offset = require_transaction_bytes(
+            raw_transaction, offset, script_length, "input script"
+        )
+        offset = require_transaction_bytes(
+            raw_transaction, offset, 4, "input sequence"
+        )
+
+    output_count, offset = read_compact_size(raw_transaction, offset)
+    if output_count == 0 or output_count > (len(raw_transaction) - offset) // 9:
+        raise ValueError("Transaction has an invalid output count")
+    for _ in range(output_count):
+        offset = require_transaction_bytes(
+            raw_transaction, offset, 8, "output value"
+        )
+        script_length, offset = read_compact_size(raw_transaction, offset)
+        offset = require_transaction_bytes(
+            raw_transaction, offset, script_length, "output script"
+        )
+
+    outputs_end = offset
+    has_witness_data = False
+    if has_witness:
+        for _ in range(input_count):
+            item_count, offset = read_compact_size(raw_transaction, offset)
+            if item_count > len(raw_transaction) - offset:
+                raise ValueError("Transaction has an invalid witness item count")
+            has_witness_data = has_witness_data or item_count > 0
+            for _ in range(item_count):
+                item_length, offset = read_compact_size(raw_transaction, offset)
+                offset = require_transaction_bytes(
+                    raw_transaction, offset, item_length, "witness item"
+                )
+        if not has_witness_data:
+            raise ValueError("Transaction has a superfluous witness record")
+
+    offset = require_transaction_bytes(raw_transaction, offset, 4, "locktime")
+    if offset != len(raw_transaction):
+        raise ValueError("Transaction has trailing data")
+
+    stripped_transaction = (
+        raw_transaction[:4]
+        + raw_transaction[inputs_start:outputs_end]
+        + raw_transaction[offset - 4 : offset]
+    )
+    return (
+        double_sha256(stripped_transaction),
+        double_sha256(raw_transaction),
+    )
 
 
 def script_number(value: int) -> bytes:
@@ -141,13 +241,28 @@ def template_transactions(template: dict) -> tuple[list[bytes], list[bytes]]:
             raise ValueError(f"Template transaction {index} is not an object")
         try:
             raw_tx = bytes.fromhex(transaction["data"])
-            txid = bytes.fromhex(transaction["txid"])[::-1]
+            expected_txid = bytes.fromhex(transaction["txid"])
+            expected_wtxid = bytes.fromhex(transaction["hash"])
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(
-                f"Template transaction {index} is missing valid data/txid"
+                f"Template transaction {index} is missing valid data/txid/hash"
             ) from error
-        if len(txid) != 32 or not raw_tx:
+        if len(expected_txid) != 32 or len(expected_wtxid) != 32 or not raw_tx:
             raise ValueError(f"Template transaction {index} has invalid length")
+        try:
+            txid, wtxid = transaction_hashes(raw_tx)
+        except ValueError as error:
+            raise ValueError(
+                f"Template transaction {index} is malformed: {error}"
+            ) from error
+        if txid[::-1] != expected_txid:
+            raise ValueError(
+                f"Template transaction {index} txid does not match its data"
+            )
+        if wtxid[::-1] != expected_wtxid:
+            raise ValueError(
+                f"Template transaction {index} witness hash does not match its data"
+            )
         tx_data.append(raw_tx)
         txids.append(txid)
     return tx_data, txids
@@ -159,7 +274,7 @@ def get_witness_commitment(
 ) -> bytes | None:
     template_commitment = template.get("default_witness_commitment")
     if template_commitment is None:
-        if any("hash" in transaction for transaction in transactions):
+        if any(transaction_has_witness(transaction) for transaction in transactions):
             raise ValueError("Segwit template is missing its witness commitment")
         return None
 
@@ -176,7 +291,7 @@ def get_witness_commitment(
     witness_hashes = [b"\x00" * 32]
     for index, transaction in enumerate(transactions):
         try:
-            wtxid = bytes.fromhex(transaction.get("hash", transaction["txid"]))[::-1]
+            wtxid = bytes.fromhex(transaction["hash"])[::-1]
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(
                 f"Template transaction {index} has an invalid witness hash"
@@ -210,6 +325,21 @@ def build_header(template: dict, coinbase_txid: bytes, transaction_txids: list[b
     )
 
 
+def serialize_block(
+    header: bytes,
+    coinbase: bytes,
+    transactions: list[bytes],
+) -> bytes:
+    if len(header) != 80:
+        raise ValueError(f"Bitcoin block header must be 80 bytes, got {len(header)}")
+    return (
+        header
+        + compact_size(1 + len(transactions))
+        + coinbase
+        + b"".join(transactions)
+    )
+
+
 def validate_template_target(template: dict) -> tuple[int, int]:
     bits_text = template.get("bits")
     target_text = template.get("target")
@@ -240,6 +370,161 @@ def validate_template_target(template: dict) -> tuple[int, int]:
             f"gbt_target={target_text.lower()}"
         )
     return bits, decoded_target
+
+
+def template_uint(template: dict, field: str, maximum: int) -> int:
+    value = template.get(field)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= maximum
+    ):
+        raise RuntimeError(
+            f"Block template {field} must be an integer from 0 through {maximum}"
+        )
+    return value
+
+
+def parse_nonce_range(value: object) -> tuple[int, int]:
+    if (
+        not isinstance(value, str)
+        or len(value) != 16
+        or any(character not in "0123456789abcdefABCDEF" for character in value)
+    ):
+        raise RuntimeError(
+            "Block template noncerange must be exactly 16 hexadecimal characters"
+        )
+    lower = int(value[:8], 16)
+    upper = int(value[8:], 16)
+    if lower > upper:
+        raise RuntimeError(
+            "Block template noncerange has its lower bound above its upper bound"
+        )
+    # Bitcoin Core's default range spans both endpoints of the uint32 nonce.
+    return lower, upper
+
+
+def transaction_has_witness(transaction: dict) -> bool:
+    raw_transaction = bytes.fromhex(transaction["data"])
+    return (
+        len(raw_transaction) >= 6
+        and raw_transaction[4] == 0
+        and raw_transaction[5] != 0
+    )
+
+
+def validate_template(
+    template: dict,
+) -> tuple[int, int, int, int]:
+    required_fields = (
+        "version",
+        "previousblockhash",
+        "height",
+        "bits",
+        "target",
+        "curtime",
+        "mintime",
+        "noncerange",
+        "mutable",
+        "transactions",
+        "coinbasevalue",
+    )
+    missing = [field for field in required_fields if field not in template]
+    if missing:
+        raise RuntimeError(
+            "Block template is missing required fields: " + ", ".join(missing)
+        )
+
+    template_uint(template, "version", 0xFFFFFFFF)
+    template_uint(template, "height", 0x7FFFFFFF)
+    template_uint(template, "coinbasevalue", MAX_MONEY)
+    curtime = template_uint(template, "curtime", 0xFFFFFFFF)
+    mintime = template_uint(template, "mintime", 0xFFFFFFFF)
+    if curtime < mintime:
+        raise RuntimeError(
+            f"Block template curtime {curtime} is earlier than mintime {mintime}"
+        )
+
+    previous_hash = template["previousblockhash"]
+    if (
+        not isinstance(previous_hash, str)
+        or len(previous_hash) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in previous_hash)
+    ):
+        raise RuntimeError(
+            "Block template previousblockhash must be exactly 64 hexadecimal characters"
+        )
+
+    bits, target = validate_template_target(template)
+    nonce_start, nonce_end = parse_nonce_range(template["noncerange"])
+
+    mutable = template["mutable"]
+    if not isinstance(mutable, list) or any(
+        not isinstance(item, str) for item in mutable
+    ):
+        raise RuntimeError("Block template mutable must be an array of strings")
+
+    transactions = template["transactions"]
+    if not isinstance(transactions, list):
+        raise RuntimeError("Block template transactions field must be an array")
+    for index, transaction in enumerate(transactions):
+        if not isinstance(transaction, dict):
+            raise RuntimeError(f"Template transaction {index} must be an object")
+        try:
+            raw_data = transaction["data"]
+            txid = transaction["txid"]
+        except KeyError as error:
+            raise RuntimeError(
+                f"Template transaction {index} is missing {error.args[0]}"
+            ) from error
+        if (
+            not isinstance(raw_data, str)
+            or not raw_data
+            or len(raw_data) % 2
+            or any(character not in "0123456789abcdefABCDEF" for character in raw_data)
+        ):
+            raise RuntimeError(
+                f"Template transaction {index} data must be nonempty hexadecimal"
+            )
+        if (
+            not isinstance(txid, str)
+            or len(txid) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in txid)
+        ):
+            raise RuntimeError(
+                f"Template transaction {index} txid must be 64 hexadecimal characters"
+            )
+        try:
+            witness_txid = transaction["hash"]
+        except KeyError as error:
+            raise RuntimeError(
+                f"Template transaction {index} is missing hash"
+            ) from error
+        if (
+            not isinstance(witness_txid, str)
+            or len(witness_txid) != 64
+            or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in witness_txid
+            )
+        ):
+            raise RuntimeError(
+                f"Template transaction {index} hash must be 64 hexadecimal characters"
+            )
+
+    commitment = template.get("default_witness_commitment")
+    if commitment is not None and (
+        not isinstance(commitment, str)
+        or len(commitment) % 2
+        or any(character not in "0123456789abcdefABCDEF" for character in commitment)
+    ):
+        raise RuntimeError(
+            "Block template default_witness_commitment must be hexadecimal"
+        )
+    if commitment is None and any(transaction_has_witness(tx) for tx in transactions):
+        raise RuntimeError("Segwit template is missing its witness commitment")
+
+    return bits, target, nonce_start, nonce_end
 
 
 def bitcoin_cli_command(
@@ -344,14 +629,16 @@ def find_nonce(
     header: bytes,
     bits: int,
     chunk_size: int,
+    nonce_start: int,
+    nonce_end: int,
     stale_check: Callable[[], bool],
 ) -> tuple[int, bytes] | None:
     target = bits_to_target(bits)
-    start = 0
-    while start < NONCE_LIMIT:
+    start = nonce_start
+    while start <= nonce_end:
         if stale_check():
             raise StaleTemplate
-        count = min(chunk_size, NONCE_LIMIT - start)
+        count = min(chunk_size, nonce_end - start + 1)
         candidate = mine_chunk(cuda_miner, header, start, count)
         if candidate is not None:
             nonce, displayed_hash = candidate
@@ -366,11 +653,13 @@ def find_nonce(
             return nonce, actual_hash
         start += count
 
-    # The CUDA result sentinel is 0xffffffff; check that final nonce on the CPU.
-    last_header = header[:76] + struct.pack("<I", 0xFFFFFFFF)
-    last_hash = double_sha256(last_header)
-    if int.from_bytes(last_hash[::-1], "big") <= target:
-        return 0xFFFFFFFF, last_hash
+    # CUDA uses 0xffffffff as its no-result sentinel, so verify that nonce on
+    # the CPU when it is included in the template's permitted range.
+    if nonce_start <= 0xFFFFFFFF <= nonce_end:
+        last_header = header[:76] + struct.pack("<I", 0xFFFFFFFF)
+        last_hash = double_sha256(last_header)
+        if int.from_bytes(last_hash[::-1], "big") <= target:
+            return 0xFFFFFFFF, last_hash
     return None
 
 
@@ -394,13 +683,15 @@ def mine_one_block(
     )
     if not isinstance(template, dict):
         raise RuntimeError("getblocktemplate returned an unexpected response")
-    required = ("height", "version", "previousblockhash", "curtime", "bits")
-    if any(key not in template for key in required):
-        raise RuntimeError("Block template is missing required header fields")
-    bits, target = validate_template_target(template)
+    bits, target, nonce_start, nonce_end = validate_template(template)
     print(
         f"Template target cross-check: bits={template['bits']}, "
         f"decoded_target={target:064x}, gbt_target={template['target'].lower()}",
+        flush=True,
+    )
+    print(
+        f"Template nonce range: {nonce_start:08x}..{nonce_end:08x}; "
+        f"time={template['curtime']} (minimum={template['mintime']})",
         flush=True,
     )
 
@@ -411,16 +702,14 @@ def mine_one_block(
     except ValueError as error:
         raise RuntimeError("Template coinbase flags are not valid hexadecimal") from error
 
-    transactions = template.get("transactions", [])
-    if not isinstance(transactions, list):
-        raise RuntimeError("Block template transactions field is invalid")
+    transactions = template["transactions"]
     try:
         witness_commitment = get_witness_commitment(template, transactions)
         coinbase, coinbase_txid = create_coinbase(
             int(template["height"]),
             coinbase_flags,
             extra_nonce,
-            int(template["coinbasevalue"]),
+            template["coinbasevalue"],
             payout_script,
             witness_commitment,
         )
@@ -440,6 +729,8 @@ def mine_one_block(
             header,
             bits,
             chunk_size,
+            nonce_start,
+            nonce_end,
             lambda: rpc(
                 cli,
                 network,
@@ -460,12 +751,7 @@ def mine_one_block(
 
     nonce, raw_hash = candidate
     mined_header = header[:76] + struct.pack("<I", nonce)
-    block = (
-        mined_header
-        + compact_size(1 + len(transaction_data))
-        + coinbase
-        + b"".join(transaction_data)
-    )
+    block = serialize_block(mined_header, coinbase, transaction_data)
     block_hash = raw_hash[::-1].hex()
     print(f"Found nonce {nonce}; block hash {block_hash}", flush=True)
 
