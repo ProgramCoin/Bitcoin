@@ -1,0 +1,18 @@
+# Compiled binaries and CUDA output
+*.exe
+*.obj
+*.cubin
+*.ptx
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Secrets and local Bitcoin data
+bitcoin.conf
+.env
+.env.*
+wallet.dat
+wallets/
+cuda_miner.exe
+gpu_test.exe
