@@ -752,24 +752,101 @@ def mine_one_block(
     nonce, raw_hash = candidate
     mined_header = header[:76] + struct.pack("<I", nonce)
     block = serialize_block(mined_header, coinbase, transaction_data)
-    block_hash = raw_hash[::-1].hex()
-    print(f"Found nonce {nonce}; block hash {block_hash}", flush=True)
+    block_hash = double_sha256(mined_header)[::-1].hex()
+    if block_hash != raw_hash[::-1].hex():
+        raise RuntimeError("Local block-header hash changed after candidate verification")
+    print(
+        f"CANDIDATE FOUND: height={template['height']} nonce={nonce} "
+        f"hash={block_hash}",
+        flush=True,
+    )
 
     if rpc(cli, network, datadir, conf, "getbestblockhash") != expected_previous:
-        print("Template became stale before submission; requesting new work.")
+        print("STALE/ORPHANED: candidate became stale before submission.")
         return False
 
     submission = rpc(cli, network, datadir, conf, "submitblock", block.hex())
     if submission is not None:
+        print(f"REJECTED: submitblock response={submission!r}", flush=True)
         raise RuntimeError(f"Bitcoin Core rejected the block: {submission}")
+    print(
+        "SUBMITTED: submitblock response=None "
+        "(bitcoin-cli returned no text for Core's null result)",
+        flush=True,
+    )
 
-    height = rpc(cli, network, datadir, conf, "getblockcount")
-    if not isinstance(height, int) or height < int(template["height"]):
-        raise RuntimeError(
-            "submitblock returned null but the regtest chain height did not advance"
+    status = submitted_block_status(
+        cli,
+        network,
+        datadir,
+        conf,
+        int(template["height"]),
+        block_hash,
+    )
+    if status == "ACTIVE CHAIN":
+        print(
+            f"ACCEPTED: Bitcoin Core recognizes block {block_hash}.",
+            flush=True,
         )
-    print(f"Bitcoin Core accepted the block; current height is {height}.")
-    return True
+        print(
+            f"ACTIVE CHAIN: block {block_hash} is active at height "
+            f"{template['height']}.",
+            flush=True,
+        )
+        return True
+    if status == "STALE/ORPHANED":
+        print(
+            f"STALE/ORPHANED: Core knows block {block_hash}, "
+            "but it is not on the active chain.",
+            flush=True,
+        )
+        return False
+
+    print(
+        f"SUBMITTED: Core knows block {block_hash}, "
+        "but active-chain inclusion is not confirmed.",
+        flush=True,
+    )
+    return False
+
+
+def submitted_block_status(
+    cli: Path,
+    network: str,
+    datadir: Path | None,
+    conf: Path | None,
+    candidate_height: int,
+    candidate_hash: str,
+) -> str:
+    chain_height = rpc(cli, network, datadir, conf, "getblockcount")
+    if isinstance(chain_height, bool) or not isinstance(chain_height, int):
+        raise RuntimeError("Bitcoin Core returned an invalid chain height")
+
+    if chain_height >= candidate_height:
+        active_hash = rpc(
+            cli,
+            network,
+            datadir,
+            conf,
+            "getblockhash",
+            candidate_height,
+        )
+        if active_hash == candidate_hash:
+            return "ACTIVE CHAIN"
+
+    header = rpc(cli, network, datadir, conf, "getblockheader", candidate_hash)
+    if not isinstance(header, dict) or header.get("hash") != candidate_hash:
+        raise RuntimeError(
+            "Bitcoin Core did not return the submitted block's header"
+        )
+    confirmations = header.get("confirmations")
+    if isinstance(confirmations, bool) or not isinstance(confirmations, int):
+        raise RuntimeError(
+            "Bitcoin Core returned an invalid block confirmation count"
+        )
+    if confirmations < 0:
+        return "STALE/ORPHANED"
+    return "SUBMITTED"
 
 
 def parse_args() -> argparse.Namespace:
@@ -817,8 +894,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=500000000,
-        help="Nonces per CUDA process invocation (default: 500000000)",
+        default=250000000,
+        help="Nonces per CUDA process invocation (default: 250000000)",
     )
     return parser.parse_args()
 

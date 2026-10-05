@@ -1,3 +1,7 @@
+
+### Hardware Note: This project was developed and tested on an NVIDIA GeForce RTX 3050 Laptop GPU. While capable as a general-purpose GPU, the RTX 3050 provides relatively limited compute performance for Bitcoin's SHA-256 mining workload. As a result, the mining performance demonstrated by this project should not be interpreted as the maximum performance of the software on more powerful hardware
+
+
 ## Bitcoin Core CUDA solo miner
 
 The runner supports Bitcoin Core `regtest` and `mainnet`. Regtest remains the
@@ -64,7 +68,8 @@ By default, the runner uses
 network datadir, and mines one block. Use `--datadir <path>` if the node was
 started with a custom datadir, `--bitcoin-conf <path>` to select a non-default
 configuration file, `--blocks 0` to keep mining until interrupted, or
-`--chunk-size <count>` to change the GPU nonce batch size (default: 500,000,000). Use
+`--chunk-size <count>` to change the GPU nonce batch size (default:
+250,000,000). Use
 `--bitcoin-cli <path>` and `--cuda-miner <path>` if the executables are in
 different locations.
 

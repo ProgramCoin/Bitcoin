@@ -12,15 +12,17 @@ from bitcoin import (
     target_to_bits,
 )
 from regtest_miner import (
-    WITNESS_COMMITMENT_PREFIX,
+    build_header as build_template_header,
     create_coinbase,
     find_nonce,
     get_witness_commitment,
     merkle_root,
+    parse_args,
     parse_nonce_range,
     read_compact_size,
     script_number,
     serialize_block,
+    submitted_block_status,
     template_transactions,
     transaction_hashes,
     validate_template,
@@ -59,7 +61,7 @@ GENESIS_MERKLE_ROOT = (
 GENESIS_HEADER = (
     "01000000"
     + "00" * 32
-    + "3ba3edfd7a7b12b27ac72c3e6776f8617fc81bc3888a18323a9fb8aa4b1e5e4a"
+    + "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
     + "29ab5f49ffff001d1dac2b7c"
 )
 CUDA_MINER = Path(__file__).with_name("cuda_miner.exe")
@@ -113,6 +115,12 @@ def valid_template() -> dict:
 
 
 class TemplateValidationTests(unittest.TestCase):
+    def test_default_chunk_size(self) -> None:
+        with patch("sys.argv", ["regtest_miner.py"]):
+            args = parse_args()
+
+        self.assertEqual(args.chunk_size, 250_000_000)
+
     def test_accepts_valid_template_and_returns_inclusive_nonce_bounds(self) -> None:
         bits, target, nonce_start, nonce_end = validate_template(valid_template())
 
@@ -259,7 +267,7 @@ class BitcoinProtocolTests(unittest.TestCase):
             GENESIS_MERKLE_ROOT,
             1_231_006_505,
             0x1D00FFFF,
-            2_083_ಿಸ್,
+            2_083_236_893,
         )
 
         self.assertEqual(header.hex(), GENESIS_HEADER)
@@ -287,6 +295,31 @@ class BitcoinProtocolTests(unittest.TestCase):
         self.assertEqual(coinbase.hex(), COINBASE_TRANSACTION)
         self.assertEqual(txid, double_sha256(coinbase))
 
+    def test_extranonce_rebuilds_coinbase_merkle_root_and_header(self) -> None:
+        template = valid_template()
+        coinbase_zero, txid_zero = create_coinbase(
+            1,
+            b"",
+            0,
+            5_000_000_000,
+            b"\x51",
+            None,
+        )
+        coinbase_one, txid_one = create_coinbase(
+            1,
+            b"",
+            1,
+            5_000_000_000,
+            b"\x51",
+            None,
+        )
+        header_zero = build_template_header(template, txid_zero, [])
+        header_one = build_template_header(template, txid_one, [])
+
+        self.assertNotEqual(coinbase_zero, coinbase_one)
+        self.assertNotEqual(merkle_root([txid_zero]), merkle_root([txid_one]))
+        self.assertNotEqual(header_zero, header_one)
+
     def test_coinbase_witness_serialization(self) -> None:
         commitment = bytes.fromhex(WITNESS_COMMITMENT)
         full_coinbase, txid = create_coinbase(
@@ -297,21 +330,39 @@ class BitcoinProtocolTests(unittest.TestCase):
             b"\x51",
             commitment,
         )
-        stripped_coinbase = bytes.fromhex(COINBASE_TRANSACTION)
+        script_sig = b"\x51" + bytes(8)
+        tx_input = (
+            b"\x01"
+            + bytes(32)
+            + b"\xff" * 4
+            + bytes((len(script_sig),))
+            + script_sig
+            + b"\xff" * 4
+        )
+        tx_outputs = (
+            b"\x02"
+            + struct.pack("<Q", 5_000_000_000)
+            + b"\x01\x51"
+            + bytes(8)
+            + bytes((len(commitment),))
+            + commitment
+        )
+        stripped_coinbase = struct.pack("<i", 2) + tx_input + tx_outputs + bytes(4)
         expected_full = (
             stripped_coinbase[:4]
             + b"\x00\x01"
-            + stripped_coinbase[4:-4]
+            + tx_input
+            + tx_outputs
             + b"\x01\x20"
             + bytes(32)
-            + stripped_coinbase[-4:]
+            + bytes(4)
         )
 
         self.assertEqual(full_coinbase, expected_full)
         self.assertEqual(txid, double_sha256(stripped_coinbase))
 
     def test_merkle_root_and_odd_leaf_duplication(self) -> None:
-        leaves = [bytes.fromhex(byte * 64) for byte in ("01", "02", "03")]
+        leaves = [bytes.fromhex(byte * 32) for byte in ("01", "02", "03")]
         duplicated_leaves = leaves + [leaves[-1]]
 
         self.assertEqual(
@@ -337,7 +388,7 @@ class BitcoinProtocolTests(unittest.TestCase):
         }
         self.assertEqual(
             get_witness_commitment(template, [transaction]),
-            WITNESS_COMMITMENT_PREFIX + bytes.fromhex(WITNESS_COMMITMENT)[6:],
+            bytes.fromhex(WITNESS_COMMITMENT),
         )
 
     def test_full_block_serialization(self) -> None:
@@ -389,6 +440,64 @@ class BitcoinProtocolTests(unittest.TestCase):
             "FOUND 107938 "
             "00009dac139e241aac5c9bfda9a7526dd697145b3147332cdbc0bd3e7ff24b42",
         )
+
+
+class SubmittedBlockStatusTests(unittest.TestCase):
+    def test_requires_exact_active_chain_hash(self) -> None:
+        with patch(
+            "regtest_miner.rpc",
+            side_effect=[101, "ab" * 32],
+        ) as rpc_mock:
+            status = submitted_block_status(
+                "bitcoin-cli.exe",
+                "regtest",
+                None,
+                None,
+                101,
+                "ab" * 32,
+            )
+
+        self.assertEqual(status, "ACTIVE CHAIN")
+        self.assertEqual(rpc_mock.call_count, 2)
+
+    def test_identifies_known_side_chain_block_as_stale(self) -> None:
+        with patch(
+            "regtest_miner.rpc",
+            side_effect=[
+                101,
+                "cd" * 32,
+                {"hash": "ab" * 32, "height": 101, "confirmations": -1},
+            ],
+        ):
+            status = submitted_block_status(
+                "bitcoin-cli.exe",
+                "regtest",
+                None,
+                None,
+                101,
+                "ab" * 32,
+            )
+
+        self.assertEqual(status, "STALE/ORPHANED")
+
+    def test_does_not_infer_active_status_from_height_alone(self) -> None:
+        with patch(
+            "regtest_miner.rpc",
+            side_effect=[
+                100,
+                {"hash": "ab" * 32, "height": 101, "confirmations": 0},
+            ],
+        ):
+            status = submitted_block_status(
+                "bitcoin-cli.exe",
+                "regtest",
+                None,
+                None,
+                101,
+                "ab" * 32,
+            )
+
+        self.assertEqual(status, "SUBMITTED")
 
 
 if __name__ == "__main__":
