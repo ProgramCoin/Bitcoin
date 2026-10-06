@@ -1,8 +1,11 @@
 import argparse
 import json
+import math
+import socket
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -27,6 +30,196 @@ RAW_STRING_RPC_METHODS = {
 
 class StaleTemplate(Exception):
     pass
+
+
+def socks5_ready(host: str, port: int, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as connection:
+            connection.settimeout(timeout)
+            connection.sendall(b"\x05\x01\x00")
+            response = bytearray()
+            while len(response) < 2:
+                chunk = connection.recv(2 - len(response))
+                if not chunk:
+                    return False
+                response.extend(chunk)
+            return response == b"\x05\x00"
+    except OSError:
+        return False
+
+
+def ensure_tor_ready(
+    host: str,
+    port: int,
+    executable: Path | None,
+    timeout: float,
+    poll_interval: float,
+) -> subprocess.Popen[bytes] | None:
+    if socks5_ready(host, port, min(1.0, timeout)):
+        print(f"[TOR] SOCKS5 proxy already available at {host}:{port}.")
+        print("[TOR] Tor ready.")
+        return None
+
+    print(f"[TOR] Tor not detected on {host}:{port}.")
+    if executable is None:
+        raise RuntimeError(
+            "Tor SOCKS5 is unavailable and no Tor executable was configured; "
+            "use --tor-executable to allow automatic startup; CUDA mining was prevented"
+        )
+    if not executable.is_file():
+        raise RuntimeError(f"Configured Tor executable not found: {executable}")
+
+    print("[TOR] Starting Tor...")
+    endpoint = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        owned_process = subprocess.Popen(
+            [str(executable), "--SocksPort", endpoint],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+        )
+    except OSError as error:
+        raise RuntimeError(f"Could not start configured Tor executable: {error}") from error
+
+    deadline = time.monotonic() + timeout
+    print("[TOR] Waiting for SOCKS5 proxy...")
+    try:
+        while time.monotonic() < deadline:
+            exit_code = owned_process.poll()
+            if exit_code is not None:
+                raise RuntimeError(
+                    f"Tor exited with status {exit_code} before its SOCKS5 "
+                    "proxy became ready"
+                )
+            if socks5_ready(host, port, min(1.0, poll_interval)):
+                print("[TOR] SOCKS5 proxy detected.")
+                print("[TOR] Tor ready.")
+                return owned_process
+            time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+
+        raise RuntimeError(
+            f"Tor SOCKS5 proxy did not become ready at {host}:{port} "
+            f"within {timeout:g} seconds; CUDA mining was prevented"
+        )
+    except (RuntimeError, KeyboardInterrupt):
+        stop_owned_tor(owned_process)
+        raise
+
+
+def stop_owned_tor(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            return
+        process.wait()
+
+
+def preflight_mainnet(
+    cli: Path,
+    datadir: Path | None,
+    conf: Path | None,
+    tor_host: str,
+    tor_port: int,
+    tor_executable: Path | None,
+    tor_timeout: float,
+    tor_poll_interval: float,
+    require_onion_peers: bool,
+) -> subprocess.Popen[bytes] | None:
+    owned_tor = ensure_tor_ready(
+        tor_host,
+        tor_port,
+        tor_executable,
+        tor_timeout,
+        tor_poll_interval,
+    )
+    try:
+        chain = rpc(cli, "mainnet", datadir, conf, "getblockchaininfo")
+        if not isinstance(chain, dict) or chain.get("chain") != "main":
+            raise RuntimeError("Bitcoin Core RPC did not confirm the main chain")
+        if chain.get("initialblockdownload") is not False:
+            raise RuntimeError(
+                "Bitcoin Core is in initial block download or did not report "
+                "initialblockdownload=false; CUDA mining was prevented"
+            )
+
+        blocks = chain.get("blocks")
+        headers = chain.get("headers")
+        if (
+            isinstance(blocks, bool)
+            or not isinstance(blocks, int)
+            or isinstance(headers, bool)
+            or not isinstance(headers, int)
+            or blocks != headers
+        ):
+            raise RuntimeError(
+                "Bitcoin Core is not synchronized to its known header tip "
+                f"(blocks={blocks!r}, headers={headers!r}); CUDA mining was prevented"
+            )
+
+        network_info = rpc(cli, "mainnet", datadir, conf, "getnetworkinfo")
+        if (
+            not isinstance(network_info, dict)
+            or network_info.get("networkactive") is not True
+        ):
+            raise RuntimeError(
+                "Bitcoin Core networking is inactive or not confirmed active; "
+                "CUDA mining was prevented"
+            )
+        connections = network_info.get("connections")
+        if (
+            isinstance(connections, bool)
+            or not isinstance(connections, int)
+            or connections < 1
+        ):
+            raise RuntimeError(
+                "Bitcoin Core has no connected peers; CUDA mining was prevented"
+            )
+        if require_onion_peers:
+            peers = rpc(cli, "mainnet", datadir, conf, "getpeerinfo")
+            if not isinstance(peers, list) or not any(
+                isinstance(peer, dict)
+                and (
+                    peer.get("network") == "onion"
+                    or (
+                        isinstance(peer.get("addr"), str)
+                        and ".onion" in peer["addr"].lower()
+                    )
+                )
+                for peer in peers
+            ):
+                raise RuntimeError(
+                    "Tor-only operation was required, but Bitcoin Core has no "
+                    "connected onion peer; CUDA mining was prevented"
+                )
+
+        print(
+            f"[CORE] Connected to mainnet at height {blocks}; "
+            f"{connections} peer(s), headers synchronized."
+        )
+        if require_onion_peers:
+            print("[CORE] At least one onion peer is connected.")
+        return owned_tor
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        KeyError,
+        subprocess.SubprocessError,
+        KeyboardInterrupt,
+    ):
+        stop_owned_tor(owned_tor)
+        raise
 
 
 def compact_size(value: int) -> bytes:
@@ -635,12 +828,30 @@ def find_nonce(
 ) -> tuple[int, bytes] | None:
     target = bits_to_target(bits)
     start = nonce_start
+    total_hashes = 0
+    scan_started = time.perf_counter()
     while start <= nonce_end:
         if stale_check():
+            if total_hashes:
+                print()
             raise StaleTemplate
         count = min(chunk_size, nonce_end - start + 1)
+        chunk_started = time.perf_counter()
         candidate = mine_chunk(cuda_miner, header, start, count)
+        chunk_seconds = time.perf_counter() - chunk_started
+        total_hashes += count
+        elapsed = max(time.perf_counter() - scan_started, 1e-9)
+        print(
+            f"\rHashing nonce {start:08x}..{start + count - 1:08x} "
+            f"of {nonce_start:08x}..{nonce_end:08x} | "
+            f"{total_hashes:,} hashes | "
+            f"{count / max(chunk_seconds, 1e-9):,.0f} H/s chunk | "
+            f"{total_hashes / elapsed:,.0f} H/s average",
+            end="",
+            flush=True,
+        )
         if candidate is not None:
+            print()
             nonce, displayed_hash = candidate
             if not start <= nonce < start + count:
                 raise RuntimeError("CUDA miner returned a nonce outside its assigned range")
@@ -653,6 +864,8 @@ def find_nonce(
             return nonce, actual_hash
         start += count
 
+    if total_hashes:
+        print()
     # CUDA uses 0xffffffff as its no-result sentinel, so verify that nonce on
     # the CPU when it is included in the template's permitted range.
     if nonce_start <= 0xFFFFFFFF <= nonce_end:
@@ -672,6 +885,7 @@ def mine_one_block(
     chunk_size: int,
     extra_nonce: int,
     payout_script: bytes,
+    dry_run: bool = False,
 ) -> bool:
     template = rpc(
         cli,
@@ -683,6 +897,15 @@ def mine_one_block(
     )
     if not isinstance(template, dict):
         raise RuntimeError("getblocktemplate returned an unexpected response")
+    template_previous = template.get("previousblockhash")
+    current_tip = rpc(cli, network, datadir, conf, "getbestblockhash")
+    if template_previous != current_tip:
+        print(
+            "Template previousblockhash does not match Core's current tip; "
+            "discarding it before CUDA and requesting a fresh template.",
+            flush=True,
+        )
+        return False
     bits, target, nonce_start, nonce_end = validate_template(template)
     print(
         f"Template target cross-check: bits={template['bits']}, "
@@ -718,7 +941,8 @@ def mine_one_block(
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError(f"Invalid block template: {error}") from error
     print(
-        f"Mining {network} block {template['height']} "
+        f"{'Dry-running' if dry_run else 'Mining'} {network} block "
+        f"{template['height']} "
         f"(bits={template['bits']}, chunk={chunk_size:,})",
         flush=True,
     )
@@ -763,6 +987,13 @@ def mine_one_block(
 
     if rpc(cli, network, datadir, conf, "getbestblockhash") != expected_previous:
         print("STALE/ORPHANED: candidate became stale before submission.")
+        return False
+
+    if dry_run:
+        print(
+            f"DRY RUN: candidate {block_hash} verified locally and not submitted.",
+            flush=True,
+        )
         return False
 
     submission = rpc(cli, network, datadir, conf, "submitblock", block.hex())
@@ -860,6 +1091,19 @@ def parse_args() -> argparse.Namespace:
         help="Bitcoin Core network (default: regtest)",
     )
     parser.add_argument(
+        "--mainnet",
+        dest="network",
+        action="store_const",
+        const="mainnet",
+        default=argparse.SUPPRESS,
+        help="Select Bitcoin mainnet (equivalent to --network mainnet)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Continuously scan live mainnet templates without submitting blocks",
+    )
+    parser.add_argument(
         "--bitcoin-cli",
         type=Path,
         default=DEFAULT_CORE_CLI,
@@ -882,6 +1126,39 @@ def parse_args() -> argparse.Namespace:
         help="Path to the bitcoin.conf used by Bitcoin Core",
     )
     parser.add_argument(
+        "--tor-host",
+        default="127.0.0.1",
+        help="Tor SOCKS5 host for mainnet preflight (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--tor-port",
+        type=int,
+        default=9150,
+        help="Tor SOCKS5 port for mainnet preflight (default: 9150)",
+    )
+    parser.add_argument(
+        "--tor-executable",
+        type=Path,
+        help="Standalone tor.exe to start if its SOCKS5 endpoint is unavailable",
+    )
+    parser.add_argument(
+        "--tor-startup-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for Tor SOCKS5 readiness (default: 120)",
+    )
+    parser.add_argument(
+        "--tor-poll-interval",
+        type=float,
+        default=0.5,
+        help="Seconds between Tor readiness checks (default: 0.5)",
+    )
+    parser.add_argument(
+        "--require-onion-peers",
+        action="store_true",
+        help="Require at least one connected onion peer before mainnet mining",
+    )
+    parser.add_argument(
         "--payout-address",
         help="Required on mainnet; address receiving the block reward",
     )
@@ -902,11 +1179,40 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.dry_run and args.network != "mainnet":
+        print("--dry-run requires --mainnet", file=sys.stderr)
+        return 2
+    if args.network == "mainnet" and not args.dry_run:
+        print(
+            "Live mainnet submission is gated until the required validation "
+            "stages have passed; use --mainnet --dry-run for now.",
+            file=sys.stderr,
+        )
+        return 2
     if args.blocks < 0:
         print("--blocks must be nonnegative", file=sys.stderr)
         return 2
     if not 1 <= args.chunk_size <= 0xFFFFFFFF:
         print("--chunk-size must be from 1 through 4294967295", file=sys.stderr)
+        return 2
+    if not 1 <= args.tor_port <= 65535:
+        print("--tor-port must be from 1 through 65535", file=sys.stderr)
+        return 2
+    if args.tor_startup_timeout <= 0 or args.tor_poll_interval <= 0:
+        print(
+            "--tor-startup-timeout and --tor-poll-interval must be positive",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        not args.tor_host.strip()
+        or not math.isfinite(args.tor_startup_timeout)
+        or not math.isfinite(args.tor_poll_interval)
+    ):
+        print(
+            "--tor-host must be nonempty and Tor timing values must be finite",
+            file=sys.stderr,
+        )
         return 2
     if not args.bitcoin_cli.is_file():
         print(f"bitcoin-cli.exe not found: {args.bitcoin_cli}", file=sys.stderr)
@@ -924,28 +1230,22 @@ def main() -> int:
         print("--payout-address is only supported for mainnet", file=sys.stderr)
         return 2
 
+    owned_tor: subprocess.Popen[bytes] | None = None
     try:
-        chain = rpc(
-            args.bitcoin_cli,
-            args.network,
-            args.datadir,
-            args.bitcoin_conf,
-            "getblockchaininfo",
-        )
-        expected_chain = "main" if args.network == "mainnet" else "regtest"
-        if not isinstance(chain, dict) or chain.get("chain") != expected_chain:
-            raise RuntimeError(
-                f"Connected Bitcoin Core node is not on {expected_chain}"
-            )
-        if (
-            args.network == "mainnet"
-            and chain.get("initialblockdownload") is True
-        ):
-            raise RuntimeError(
-                "Bitcoin Core is still syncing; wait for initial block download to finish"
-            )
-
         if args.network == "mainnet":
+            print("NETWORK: MAINNET")
+            print("MODE: DRY RUN")
+            owned_tor = preflight_mainnet(
+                args.bitcoin_cli,
+                args.datadir,
+                args.bitcoin_conf,
+                args.tor_host,
+                args.tor_port,
+                args.tor_executable,
+                args.tor_startup_timeout,
+                args.tor_poll_interval,
+                args.require_onion_peers,
+            )
             address_info = rpc(
                 args.bitcoin_cli,
                 args.network,
@@ -973,7 +1273,7 @@ def main() -> int:
 
         mined = 0
         extra_nonce = 0
-        while args.blocks == 0 or mined < args.blocks:
+        while args.dry_run or args.blocks == 0 or mined < args.blocks:
             if mine_one_block(
                 args.bitcoin_cli,
                 args.cuda_miner,
@@ -983,6 +1283,7 @@ def main() -> int:
                 args.chunk_size,
                 extra_nonce,
                 payout_script,
+                dry_run=args.dry_run,
             ):
                 mined += 1
                 extra_nonce = 0
@@ -993,8 +1294,11 @@ def main() -> int:
         print("\nStopped by user.")
         return 130
     except (OSError, RuntimeError, ValueError, KeyError) as error:
-        print(str(error), file=sys.stderr)
+        prefix = "CUDA mining prevented: " if args.network == "mainnet" else ""
+        print(f"{prefix}{error}", file=sys.stderr)
         return 1
+    finally:
+        stop_owned_tor(owned_tor)
 
 
 if __name__ == "__main__":

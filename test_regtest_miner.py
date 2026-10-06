@@ -1,8 +1,11 @@
+import argparse
+import io
 import unittest
 import struct
 import subprocess
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from bitcoin import (
     bits_to_target,
@@ -14,17 +17,22 @@ from bitcoin import (
 from regtest_miner import (
     build_header as build_template_header,
     create_coinbase,
+    ensure_tor_ready,
     find_nonce,
     get_witness_commitment,
+    main,
+    mine_one_block,
     merkle_root,
     parse_args,
     parse_nonce_range,
+    preflight_mainnet,
     read_compact_size,
     script_number,
     serialize_block,
     submitted_block_status,
     template_transactions,
     transaction_hashes,
+    socks5_ready,
     validate_template,
     validate_template_target,
 )
@@ -114,12 +122,358 @@ def valid_template() -> dict:
     }
 
 
+class TorStartupTests(unittest.TestCase):
+    def test_socks5_probe_negotiates_no_authentication(self) -> None:
+        connection = MagicMock()
+        connection.__enter__.return_value.recv.return_value = b"\x05\x00"
+        with patch("regtest_miner.socket.create_connection", return_value=connection):
+            self.assertTrue(socks5_ready("127.0.0.1", 9150))
+
+        connection.__enter__.return_value.sendall.assert_called_once_with(
+            b"\x05\x01\x00"
+        )
+
+    def test_existing_tor_socks_endpoint_is_reused(self) -> None:
+        with (
+            patch("regtest_miner.socks5_ready", return_value=True),
+            patch("regtest_miner.subprocess.Popen") as popen,
+            redirect_stdout(io.StringIO()),
+        ):
+            owned = ensure_tor_ready(
+                "127.0.0.1", 9150, Path(__file__), 1.0, 0.01
+            )
+
+        self.assertIsNone(owned)
+        popen.assert_not_called()
+
+    def test_absent_tor_is_started_and_waited_for(self) -> None:
+        process = MagicMock()
+        process.poll.return_value = None
+        with (
+            patch("regtest_miner.socks5_ready", side_effect=[False, True]),
+            patch("regtest_miner.subprocess.Popen", return_value=process) as popen,
+            redirect_stdout(io.StringIO()),
+        ):
+            owned = ensure_tor_ready(
+                "127.0.0.1", 9150, Path(__file__), 1.0, 0.01
+            )
+
+        self.assertIs(owned, process)
+        self.assertEqual(
+            popen.call_args.args[0],
+            [str(Path(__file__)), "--SocksPort", "127.0.0.1:9150"],
+        )
+
+    def test_tor_startup_timeout_stops_owned_process(self) -> None:
+        process = MagicMock()
+        process.poll.return_value = None
+        with (
+            patch("regtest_miner.socks5_ready", return_value=False),
+            patch("regtest_miner.subprocess.Popen", return_value=process),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "CUDA mining was prevented"):
+                ensure_tor_ready(
+                    "127.0.0.1", 9150, Path(__file__), 0.01, 0.001
+                )
+
+        process.terminate.assert_called_once()
+
+
+class StartupPreflightTests(unittest.TestCase):
+    def run_preflight(self, rpc_side_effect, require_onion_peers=False):
+        with patch("regtest_miner.ensure_tor_ready", return_value=None), patch(
+            "regtest_miner.rpc", side_effect=rpc_side_effect
+        ) as rpc_mock:
+            result = preflight_mainnet(
+                Path("bitcoin-cli.exe"),
+                None,
+                None,
+                "127.0.0.1",
+                9150,
+                None,
+                1.0,
+                0.01,
+                require_onion_peers,
+            )
+        return result, rpc_mock
+
+    def test_bitcoin_core_rpc_unavailable_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "RPC unavailable"):
+            self.run_preflight([RuntimeError("RPC unavailable")])
+
+    def test_initial_block_download_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "initial block download"):
+            self.run_preflight(
+                [{"chain": "main", "initialblockdownload": True}]
+            )
+
+    def test_no_connected_peers_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "no connected peers"):
+            self.run_preflight(
+                [
+                    {
+                        "chain": "main",
+                        "initialblockdownload": False,
+                        "blocks": 100,
+                        "headers": 100,
+                    },
+                    {
+                        "networkactive": True,
+                        "connections": 0,
+                    },
+                ]
+            )
+
+    def test_tor_only_mode_requires_an_onion_peer(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "no connected onion peer"):
+            self.run_preflight(
+                [
+                    {
+                        "chain": "main",
+                        "initialblockdownload": False,
+                        "blocks": 100,
+                        "headers": 100,
+                    },
+                    {
+                        "networkactive": True,
+                        "connections": 1,
+                    },
+                    [],
+                ],
+                require_onion_peers=True,
+            )
+
+    def test_stale_template_is_discarded_before_cuda(self) -> None:
+        with (
+            patch(
+                "regtest_miner.rpc",
+                side_effect=[valid_template(), "ff" * 32],
+            ),
+            patch("regtest_miner.find_nonce") as find_nonce,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = mine_one_block(
+                Path("bitcoin-cli.exe"),
+                Path("cuda_miner.exe"),
+                "mainnet",
+                None,
+                None,
+                1,
+                0,
+                b"\x51",
+                dry_run=True,
+            )
+
+        self.assertFalse(result)
+        find_nonce.assert_not_called()
+
+    def test_successful_preflight_reaches_cuda_chunk_launch(self) -> None:
+        args = argparse.Namespace(
+            network="mainnet",
+            dry_run=True,
+            blocks=0,
+            chunk_size=1,
+            bitcoin_cli=Path(__file__),
+            cuda_miner=Path(__file__),
+            bitcoin_conf=None,
+            datadir=None,
+            payout_address="bc1qexample",
+            tor_host="127.0.0.1",
+            tor_port=9150,
+            tor_executable=None,
+            tor_startup_timeout=1.0,
+            tor_poll_interval=0.01,
+            require_onion_peers=False,
+        )
+        template = valid_template()
+        template["noncerange"] = "0000000000000000"
+        rpc_methods = []
+
+        def fake_rpc(_cli, _network, _datadir, _conf, method, *_params):
+            rpc_methods.append(method)
+            if method == "getblockchaininfo":
+                return {
+                    "chain": "main",
+                    "initialblockdownload": False,
+                    "blocks": 100,
+                    "headers": 100,
+                }
+            if method == "getnetworkinfo":
+                return {"networkactive": True, "connections": 1}
+            if method == "validateaddress":
+                return {"isvalid": True, "scriptPubKey": "51"}
+            if method == "getblocktemplate":
+                return template
+            if method == "getbestblockhash":
+                return template["previousblockhash"]
+            self.fail(f"Unexpected RPC method: {method}")
+
+        mine_calls = 0
+
+        def mine_once_then_interrupt(*call_args, **call_kwargs):
+            nonlocal mine_calls
+            mine_calls += 1
+            if mine_calls > 1:
+                raise KeyboardInterrupt
+            return mine_one_block(*call_args, **call_kwargs)
+
+        with (
+            patch("regtest_miner.parse_args", return_value=args),
+            patch("regtest_miner.ensure_tor_ready", return_value=None),
+            patch("regtest_miner.rpc", side_effect=fake_rpc),
+            patch("regtest_miner.mine_one_block", side_effect=mine_once_then_interrupt),
+            patch("regtest_miner.mine_chunk", return_value=None) as mine_chunk,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = main()
+
+        self.assertEqual(result, 130)
+        self.assertEqual(mine_chunk.call_count, 1)
+        self.assertEqual(
+            rpc_methods[:4],
+            [
+                "getblockchaininfo",
+                "getnetworkinfo",
+                "validateaddress",
+                "getblocktemplate",
+            ],
+        )
+        self.assertNotIn("submitblock", rpc_methods)
+
+
 class TemplateValidationTests(unittest.TestCase):
     def test_default_chunk_size(self) -> None:
         with patch("sys.argv", ["regtest_miner.py"]):
             args = parse_args()
 
         self.assertEqual(args.chunk_size, 250_000_000)
+
+    def test_mainnet_dry_run_cli_forms(self) -> None:
+        for argv in (
+            [
+                "regtest_miner.py",
+                "--mainnet",
+                "--dry-run",
+                "--payout-address",
+                "bc1qexample",
+            ],
+            [
+                "regtest_miner.py",
+                "--network",
+                "mainnet",
+                "--dry-run",
+                "--payout-address",
+                "bc1qexample",
+            ],
+        ):
+            with self.subTest(argv=argv), patch("sys.argv", argv):
+                args = parse_args()
+                self.assertEqual(args.network, "mainnet")
+                self.assertTrue(args.dry_run)
+
+    def test_live_mainnet_submission_remains_gated(self) -> None:
+        args = argparse.Namespace(network="mainnet", dry_run=False)
+        error_output = io.StringIO()
+        with (
+            patch("regtest_miner.parse_args", return_value=args),
+            redirect_stderr(error_output),
+        ):
+            result = main()
+
+        self.assertEqual(result, 2)
+        self.assertIn("gated", error_output.getvalue())
+
+    def test_mainnet_dry_run_rejects_unsynchronized_core(self) -> None:
+        args = argparse.Namespace(
+            network="mainnet",
+            dry_run=True,
+            blocks=0,
+            chunk_size=10,
+            bitcoin_cli=Path(__file__),
+            cuda_miner=Path(__file__),
+            bitcoin_conf=None,
+            datadir=None,
+            payout_address="bc1qexample",
+            tor_host="127.0.0.1",
+            tor_port=9150,
+            tor_executable=None,
+            tor_startup_timeout=1.0,
+            tor_poll_interval=0.01,
+            require_onion_peers=False,
+        )
+        error_output = io.StringIO()
+        with (
+            patch("regtest_miner.parse_args", return_value=args),
+            patch("regtest_miner.ensure_tor_ready", return_value=None),
+            patch(
+                "regtest_miner.rpc",
+                return_value={
+                    "chain": "main",
+                    "initialblockdownload": False,
+                    "blocks": 100,
+                    "headers": 101,
+                },
+            ),
+            redirect_stderr(error_output),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = main()
+
+        self.assertEqual(result, 1)
+        self.assertIn("not synchronized", error_output.getvalue())
+
+    def test_dry_run_candidate_is_never_submitted(self) -> None:
+        template = valid_template()
+        template["bits"] = "207fffff"
+        template["target"] = f"{bits_to_target(0x207FFFFF):064x}"
+
+        def regtest_candidate(
+            _cuda_miner: Path,
+            header: bytes,
+            bits: int,
+            _chunk_size: int,
+            _nonce_start: int,
+            _nonce_end: int,
+            _stale_check: object,
+        ) -> tuple[int, bytes]:
+            target = bits_to_target(bits)
+            for nonce in range(10_000):
+                nonce_header = header[:76] + struct.pack("<I", nonce)
+                digest = double_sha256(nonce_header)
+                if int.from_bytes(digest[::-1], "big") <= target:
+                    return nonce, digest
+            self.fail("Could not find a valid regtest test-vector nonce")
+
+        with (
+            patch(
+                "regtest_miner.rpc",
+                side_effect=[
+                    template,
+                    template["previousblockhash"],
+                    template["previousblockhash"],
+                ],
+            ) as rpc_mock,
+            patch("regtest_miner.find_nonce", side_effect=regtest_candidate),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = mine_one_block(
+                Path("bitcoin-cli.exe"),
+                Path("cuda_miner.exe"),
+                "regtest",
+                None,
+                None,
+                10,
+                0,
+                b"\x51",
+                dry_run=True,
+            )
+
+        self.assertFalse(result)
+        self.assertNotIn(
+            "submitblock",
+            [call.args[4] for call in rpc_mock.call_args_list],
+        )
 
     def test_accepts_valid_template_and_returns_inclusive_nonce_bounds(self) -> None:
         bits, target, nonce_start, nonce_end = validate_template(valid_template())
@@ -181,7 +535,10 @@ class TemplateValidationTests(unittest.TestCase):
             scanned.append((start, count))
             return None
 
-        with patch("regtest_miner.mine_chunk", side_effect=record_scan):
+        with (
+            patch("regtest_miner.mine_chunk", side_effect=record_scan),
+            redirect_stdout(io.StringIO()),
+        ):
             result = find_nonce(
                 "cuda_miner.exe",
                 bytes(80),
