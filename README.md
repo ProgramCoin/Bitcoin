@@ -353,3 +353,108 @@ the same source and toolchain (CUDA 13.4, MSVC 19.51).
 The CUDA executable without arguments retains its synthetic-header benchmark,
 and `--scan-header <80-byte-hex> --start <n> --count <n>` still performs a
 single one-shot scan.
+
+## Operating notes
+
+### What to expect from a GPU
+
+Solo mining Bitcoin on a graphics card is a lottery ticket, not an income.
+At about 725 MH/s and a difficulty of about 1.3 x 10^14 (October 2026):
+
+| Quantity | Value |
+| --- | --- |
+| Share of the network's hashrate | about 1 part in 1.3 trillion |
+| Chance per day of continuous mining | about 1 in 9 billion |
+| Chance per year of continuous mining | about 1 in 25 million |
+| Average time to find one block | about 25 million years |
+
+Each hash is independent, so the chance does not improve with time already
+spent. Graphics cards found blocks routinely from mid-2010 until ASICs arrived
+in 2013; the smallest solo winners reported since then used ASICs of about
+1 TH/s and up, which is more than a thousand times this rate. The electricity
+used costs far more than the expected reward. The project's value is a
+correct, verified miner, not its earnings.
+
+### Measured performance (RTX 3050 Laptop GPU)
+
+| Measurement | Result |
+| --- | --- |
+| First seconds from idle | about 810-830 MH/s |
+| Sustained, GPU at 86-87 C | about 700-750 MH/s |
+| Effective rate as a share of the raw rate | about 99.9% |
+| GPU idle between work items | about 0.1% |
+| Gap at an extranonce rollover | under 1 ms |
+| CUDA reply to `submitblock` sent | 0.1-16 ms (regtest, up to a full-weight block) |
+
+The card is limited by heat, not by the code: the driver holds 86-87 C by
+lowering clock and power, and the hashrate follows. Better cooling is the
+largest remaining gain. On a laptop, use a hard flat surface with the rear
+raised, the highest fan profile and mains power, and stop if the temperature
+passes 90 C. To watch it from a second window:
+
+```powershell
+nvidia-smi --query-gpu=temperature.gpu,power.draw,clocks.gr,utilization.gpu --format=csv -l 10
+```
+
+### Reading the output
+
+```
+Hashing nonce 00000000..0ee6b27f of 00000000..ffffffff | 250,000,000 hashes | ... H/s chunk | ... H/s average
+```
+
+- Every header has its own 32-bit nonce space, so each pass starts again at
+  nonce `00000000`. Seeing the same range on consecutive lines does not mean
+  the same input is being hashed: each pass uses a different extranonce and
+  therefore a different Merkle root and header.
+- `average` is the average of the current pass only, not of the session. The
+  line is printed on the first chunk of a pass and then at most every five
+  seconds, so at high hashrates only the first chunk of each pass is shown.
+- `Mining mainnet block N` names the block being attempted, which is always
+  Bitcoin Core's current tip plus one.
+- `Nonce space exhausted; switching to the refreshed template.` appears about
+  every 30 seconds with the same height: same block, updated transactions.
+- `Template became stale; requesting new work.` followed by a height one
+  higher means the network found a block and work moved on to the next one.
+- A single `[MONITOR] Tip check failed (1/3)` is harmless. `Mining paused`
+  means connectivity was lost and the runner is waiting to recover.
+
+### Running it
+
+- Start it in its own console window. A process started as a background job
+  (for example with `start /b`) ignores Ctrl+C, so it could not be stopped
+  cleanly.
+- Stop it with one Ctrl+C and wait for `Stopped by user.` This closes the
+  CUDA process and releases the idle-sleep request. Do not close the window
+  while it is mining.
+- Bitcoin Core must already be running and synchronized; the runner does not
+  start it. With `onlynet=onion` through Tor Browser's proxy, closing Tor
+  Browser drops every peer.
+- A small launcher script is a convenient place for the payout address, the
+  pinned script and `--min-peers`. Keep it out of version control if the
+  address should not be tied to the repository: this project ignores
+  `start_mining.bat` for that reason. It needs no private key, password or
+  RPC credential.
+
+### Wallet
+
+- The live preflight asks the wallet whether it owns the payout address. That
+  works with an encrypted wallet that is locked; the wallet never has to be
+  unlocked for mining.
+- Encrypting a descriptor wallet (Bitcoin Core 27) keeps existing addresses
+  and their scripts, so a pinned payout script stays valid. It also creates a
+  new seed for future addresses, so make a new backup afterwards; a backup
+  taken before encryption is unencrypted and does not contain the new seed.
+- Exactly one wallet may be loaded. With a second one loaded the ownership
+  check cannot be answered and the runner refuses to start.
+
+### What has and has not been verified
+
+Verified: payout construction against live mainnet templates, the complete
+submission path on regtest up to a full-weight block (including a lost reply,
+failed calls, and Bitcoin Core being stopped at submission time), pause and
+recovery with a real Tor interruption, block monitoring through a real
+reorganization to maturity, and clean shutdown on Ctrl+C.
+
+Not verified: an actual mainnet block submission, unattended runs longer than
+about fifteen minutes, and loss of Bitcoin Core's own peers (the tests
+interrupted the Tor proxy, not the node's connections).
