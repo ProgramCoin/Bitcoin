@@ -207,6 +207,12 @@ touches the CUDA process.
 A failed `getblocktemplate` call is handled the same way. Regtest keeps
 failing fast.
 
+While a mainnet session is mining or monitoring a block, the runner asks
+Windows not to sleep on idle. GPU load does not count as user activity, so an
+unattended machine would otherwise suspend mid-session. No power setting is
+changed and the request ends with the process; the display may still turn off,
+and closing the lid or choosing Sleep still suspends the machine.
+
 The block is passed to `bitcoin-cli` through `-stdin`, because a real mainnet
 block is far larger than the Windows command-line limit.
 
@@ -244,6 +250,9 @@ It is a solo miner, not a pool miner. At the current educational CUDA rate,
 finding a mainnet block is extraordinarily unlikely; GPU time and electricity
 costs can exceed any expected return.
 
+Omit `--bitcoin-conf` when Bitcoin Core uses its default data directory
+(`%APPDATA%\Bitcoin\bitcoin.conf`): `bitcoin-cli` finds that file by itself,
+and the runner exits at startup if the named file does not exist.
 `--bitcoin-conf` makes the runner pass that file to every `bitcoin-cli` RPC
 call. Bitcoin Core itself must also be started with that configuration if it
 is not already loading it, for example:
@@ -299,7 +308,9 @@ as a finished, immutable work item; that thread never talks to the CUDA
 process.
 
 The chain-tip check runs once per chunk. The first chunk of a template is
-checked before it is sent. For every later chunk the runner sends the request
+checked before it is sent, unless the same tip was confirmed within the last
+two seconds (after an extranonce rollover, or when a prefetched template
+takes over), in which case it is treated like a later chunk. For every later chunk the runner sends the request
 first and asks Core for its best block while the GPU is already scanning, so
 the GPU does not idle during the RPC; the chunk's result is read only after
 that check has returned. If the check reports a new tip, the chunk in flight

@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -46,6 +47,9 @@ MONITOR_FAILURES_TO_PAUSE = 2
 # Waits between recovery attempts after mining paused; the last one repeats
 # until --recovery-timeout is reached.
 RECOVERY_DELAYS = (5.0, 10.0, 20.0, 40.0, 60.0)
+# A tip confirmed this recently lets the first chunk of follow-on work start
+# before its own tip check instead of after it.
+TIP_CONFIRMATION_SECONDS = 2.0
 # A template older than this is replaced at the next nonce-space rollover;
 # until then exhausted nonce space only rolls the coinbase extranonce.
 TEMPLATE_REFRESH_SECONDS = 30.0
@@ -73,6 +77,25 @@ class RpcError(RuntimeError):
 
 class MiningPaused(Exception):
     """Connectivity loss was confirmed between chunks; no GPU work is in flight."""
+
+
+def keep_system_awake(enable: bool) -> None:
+    """Ask Windows not to sleep on idle while mainnet work is running.
+
+    GPU load does not count as activity, so an unattended machine would
+    otherwise suspend in the middle of mining. No power setting is changed:
+    the request belongs to this thread and ends with it. The display may
+    still turn off, and closing the lid or sleeping by hand still sleeps.
+    """
+    if sys.platform != "win32":
+        return
+    es_continuous, es_system_required = 0x80000000, 0x00000001
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            es_continuous | (es_system_required if enable else 0)
+        )
+    except (AttributeError, OSError):
+        pass
 
 
 def socks5_ready(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -1341,6 +1364,14 @@ class MiningSession:
         self.tip_failures = 0
         self.tip_error = ""
         self.accepted_block: str | None = None
+        self.confirmed_tip: tuple[str, float] | None = None
+
+    def tip_confirmed_recently(self, expected_previous: str) -> bool:
+        return (
+            self.confirmed_tip is not None
+            and self.confirmed_tip[0] == expected_previous
+            and time.monotonic() - self.confirmed_tip[1] <= TIP_CONFIRMATION_SECONDS
+        )
 
     def tip_changed(self, expected_previous: str, fetched_at: float) -> bool:
         try:
@@ -1365,7 +1396,9 @@ class MiningSession:
             return False
         self.tip_failures = 0
         if tip != expected_previous:
+            self.confirmed_tip = None
             return True
+        self.confirmed_tip = (tip, time.monotonic())
         if time.monotonic() - fetched_at >= TEMPLATE_REFRESH_SECONDS:
             self.prefetcher.request()
         return False
@@ -1379,6 +1412,7 @@ class MiningSession:
 
     def reset(self) -> None:
         self.tip_failures = 0
+        self.confirmed_tip = None
         self.monitor.reset()
         self.prefetcher.discard()
 
@@ -1578,6 +1612,7 @@ def find_nonce(
     nonce_end: int,
     stale_check: Callable[[], bool],
     pause_check: Callable[[], str | None] | None = None,
+    overlap_first_check: bool = False,
 ) -> tuple[int, bytes] | None:
     target = bits_to_target(bits)
     start = nonce_start
@@ -1588,12 +1623,21 @@ def find_nonce(
     if start <= nonce_end:
         if pause_check is not None and (reason := pause_check()):
             raise MiningPaused(reason)
-        # No GPU work starts on a template that is already stale.
-        if stale_check():
-            raise StaleTemplate
         count = min(chunk_size, nonce_end - start + 1)
-        chunk_started = time.perf_counter()
-        start_chunk(cuda_miner, header, start, count)
+        if overlap_first_check:
+            # The caller has just seen this tip confirmed, so the first chunk
+            # is treated like every later one: launched, then checked.
+            chunk_started = time.perf_counter()
+            start_chunk(cuda_miner, header, start, count)
+            if stale_check():
+                abandon_chunk(cuda_miner)
+                raise StaleTemplate
+        else:
+            # No GPU work starts on a template that is already stale.
+            if stale_check():
+                raise StaleTemplate
+            chunk_started = time.perf_counter()
+            start_chunk(cuda_miner, header, start, count)
     while count:
         # The tip check belonging to this chunk has already returned "still
         # current"; only then is the chunk's result read.
@@ -1896,6 +1940,12 @@ def mine_one_block(
             header = build_header(template, coinbase_txid, work.transaction_txids)
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError(f"Invalid block template: {error}") from error
+        # After a rollover, or when a prefetched template builds on the tip
+        # that the previous chunk's check confirmed moments ago, waiting for
+        # another check before the first chunk would only idle the GPU.
+        overlap = roll > 0 or (
+            session is not None and session.tip_confirmed_recently(expected_previous)
+        )
         try:
             candidate = find_nonce(
                 cuda_miner,
@@ -1905,6 +1955,7 @@ def mine_one_block(
                 work.nonce_start,
                 work.nonce_end,
                 *scan_checks,
+                **({"overlap_first_check": True} if overlap else {}),
             )
         except StaleTemplate:
             if isinstance(cuda_miner, CudaMiner) and cuda_miner.pending_abandoned:
@@ -2354,6 +2405,7 @@ def main() -> int:
         if not args.bitcoin_cli.is_file():
             print(f"bitcoin-cli.exe not found: {args.bitcoin_cli}", file=sys.stderr)
             return 2
+        keep_system_awake(True)
         try:
             return monitor_block(
                 args.bitcoin_cli, args.network, args.datadir, args.bitcoin_conf,
@@ -2362,6 +2414,8 @@ def main() -> int:
         except KeyboardInterrupt:
             print("\nStopped by user.")
             return 130
+        finally:
+            keep_system_awake(False)
     if args.dry_run and args.network != "mainnet":
         print("--dry-run requires --mainnet", file=sys.stderr)
         return 2
@@ -2478,6 +2532,7 @@ def main() -> int:
 
     try:
         if args.network == "mainnet":
+            keep_system_awake(True)
             print("NETWORK: MAINNET")
             if args.live_mainnet:
                 print("MODE: LIVE (valid blocks WILL be submitted with submitblock)")
@@ -2617,6 +2672,7 @@ def main() -> int:
             if session is not None:
                 session.close()
             stop_owned_tor(owned_tor)
+            keep_system_awake(False)
 
 
 if __name__ == "__main__":

@@ -2986,6 +2986,36 @@ class ExtranonceRollingTests(unittest.TestCase):
         # extra_nonce 7 from the caller in the high half, roll 2 in the low half.
         self.assertIn(struct.pack("<Q", (7 << 32) | 2), coinbase)
 
+    def test_rollover_starts_the_gpu_before_its_tip_check_and_still_honours_it(self) -> None:
+        core = FakeCore(self.small_range_template())
+        previous = core.template["previousblockhash"]
+        # Template check, first-chunk check, then the check that overlaps the
+        # first chunk after the rollover reports a new block.
+        core.tips = [previous, previous, "ff" * 32]
+        order = []
+        original = core.__call__
+
+        def recording(cli, network, datadir, conf, method, *params, **kwargs):
+            if method == "getbestblockhash":
+                order.append("check")
+            return original(cli, network, datadir, conf, method, *params, **kwargs)
+
+        process = FakeCudaProcess(
+            lambda fields: order.append(f"scan {fields[1]}") or (
+                f"{fields[1]} NONE\n" if fields[1] == "1" else cpu_scan_responder(fields)
+            )
+        )
+        self.assertFalse(self.run_block(recording, process))
+
+        # Before the rollover the check precedes the scan; after it the scan
+        # is already running when the check is made.
+        self.assertEqual(order, ["check", "check", "scan 1", "scan 2", "check"])
+        # The rolled chunk held a valid candidate; a stale verdict abandons it.
+        self.assertEqual(process.pending[0].split()[1], "FOUND")
+        self.assertNotIn(("read", "2"), process.events)
+        self.assertNotIn("submitblock", core.methods)
+        self.assertIn("Template became stale", self.output.getvalue())
+
     def test_old_template_is_replaced_instead_of_rolled(self) -> None:
         core = FakeCore(self.small_range_template())
         process = FakeCudaProcess()
@@ -3019,11 +3049,17 @@ class ExtranonceRollingTests(unittest.TestCase):
         self.assertIn("switching to the refreshed template", self.output.getvalue())
         self.assertEqual(len(process.requests), 1)
 
-        # The next call uses the prepared work: no getblocktemplate at all.
+        # The next call uses the prepared work: no getblocktemplate at all,
+        # and its first chunk starts before the tip check because the same
+        # tip was confirmed during the previous chunk.
+        self.assertTrue(session.tip_confirmed_recently(core.template["previousblockhash"]))
         core.methods.clear()
-        process = FakeCudaProcess(cpu_scan_responder)
+        process = FakeCudaProcess(
+            lambda fields: core.methods.append("scan") or cpu_scan_responder(fields)
+        )
         self.assertTrue(self.run_block(core, process, session=session))
         self.assertNotIn("getblocktemplate", core.methods)
+        self.assertEqual(core.methods[:2], ["scan", "getbestblockhash"])
         header = bytes.fromhex(process.requests[0].split()[2])
         self.assertEqual(struct.unpack("<I", header[68:72])[0], 1_700_000_030)
         self.assertFalse(prefetcher.ready())
@@ -3455,7 +3491,9 @@ class BlockMonitorTests(unittest.TestCase):
         return result, monitor
 
     def test_monitor_block_mode_never_mines(self) -> None:
-        result, monitor = self.run_main(["--mainnet", "--monitor-block", self.HASH.upper()])
+        with patch("regtest_miner.keep_system_awake") as awake:
+            result, monitor = self.run_main(["--mainnet", "--monitor-block", self.HASH.upper()])
+        self.assertEqual([call.args[0] for call in awake.call_args_list], [True, False])
         self.assertEqual(result, 0)
         self.assertEqual(monitor.call_args.args[1], "mainnet")
         self.assertEqual(monitor.call_args.args[4], self.HASH)
@@ -3463,6 +3501,63 @@ class BlockMonitorTests(unittest.TestCase):
         result, monitor = self.run_main(["--mainnet", "--monitor-block", "xyz"])
         self.assertEqual(result, 2)
         monitor.assert_not_called()
+
+    def test_mainnet_sessions_hold_off_idle_sleep_and_release_it(self) -> None:
+        # Dry-run mining, ended by Ctrl+C.
+        core = FakeCore()
+
+        def interrupt_second_template(cli, network, datadir, conf, method, *params, **kwargs):
+            if method == "getblocktemplate" and "getblocktemplate" in core.methods:
+                raise KeyboardInterrupt
+            return core(cli, network, datadir, conf, method, *params, **kwargs)
+
+        with (
+            patch("regtest_miner.parse_args", return_value=miner_args(dry_run=True)),
+            patch("regtest_miner.ensure_tor_ready", return_value=None),
+            patch("regtest_miner.rpc", side_effect=interrupt_second_template),
+            patch("regtest_miner.find_nonce", side_effect=cpu_find_nonce),
+            patch("regtest_miner.subprocess.Popen"),
+            patch("regtest_miner.save_unsubmitted_block", return_value=None),
+            patch("regtest_miner.keep_system_awake") as awake,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(main(), 130)
+        self.assertEqual([call.args[0] for call in awake.call_args_list], [True, False])
+
+        # A failed preflight still releases the request.
+        with (
+            patch("regtest_miner.parse_args", return_value=live_args()),
+            patch("regtest_miner.ensure_tor_ready", side_effect=RuntimeError("Tor SOCKS5 is unavailable")),
+            patch("regtest_miner.subprocess.Popen"),
+            patch("regtest_miner.keep_system_awake") as awake,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(main(), 1)
+        self.assertEqual([call.args[0] for call in awake.call_args_list], [True, False])
+
+        # Regtest never asks.
+        regtest = FakeCore(chain="regtest")
+        with (
+            patch("regtest_miner.parse_args", return_value=miner_args(network="regtest", payout_address=None)),
+            patch("regtest_miner.rpc", side_effect=regtest),
+            patch("regtest_miner.find_nonce", side_effect=cpu_find_nonce),
+            patch("regtest_miner.subprocess.Popen"),
+            patch("regtest_miner.keep_system_awake") as awake,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(main(), 0)
+        self.assertEqual([call.args[0] for call in awake.call_args_list], [False])
+
+    def test_keep_system_awake_requests_and_clears_the_windows_state(self) -> None:
+        with patch("regtest_miner.sys.platform", "win32"), patch("regtest_miner.ctypes") as fake:
+            regtest_miner.keep_system_awake(True)
+            regtest_miner.keep_system_awake(False)
+        calls = fake.windll.kernel32.SetThreadExecutionState.call_args_list
+        self.assertEqual([call.args[0] for call in calls], [0x80000001, 0x80000000])
+        with patch("regtest_miner.sys.platform", "linux"), patch("regtest_miner.ctypes") as fake:
+            regtest_miner.keep_system_awake(True)
+        fake.windll.kernel32.SetThreadExecutionState.assert_not_called()
 
     def test_accepted_mainnet_block_is_then_monitored(self) -> None:
         core = FakeCore()

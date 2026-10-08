@@ -17,3 +17,7 @@ wallets/
 unsubmitted_block_*.hex
 cuda_miner.exe
 gpu_test.exe
+
+# Local launcher (holds the payout address) and validation logs
+start_mining.bat
+validation_logs/
