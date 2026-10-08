@@ -14,5 +14,6 @@ bitcoin.conf
 .env.*
 wallet.dat
 wallets/
+unsubmitted_block_*.hex
 cuda_miner.exe
 gpu_test.exe

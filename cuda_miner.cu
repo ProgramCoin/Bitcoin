@@ -5,6 +5,35 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <sstream>
+#include <string>
+
+// ------------------------------------------------------------
+// Scan-kernel build options
+// ------------------------------------------------------------
+//
+// The defaults are the validated configuration. Each option can be turned
+// off (or the count changed) with -D at build time to measure it alone; every
+// combination computes exactly the same SHA256d and applies the same full
+// 256-bit target comparison.
+
+// Resume the first hash after rounds 0-3, whose nonce-independent part is
+// computed once per header instead of once per nonce.
+#ifndef MINER_RESUME_FIRST_HASH
+#define MINER_RESUME_FIRST_HASH 1
+#endif
+
+// Stop the second hash after round 60, when the most significant word of the
+// final hash is already known, and decide on that word alone unless it equals
+// the target's most significant word.
+#ifndef MINER_EARLY_SECOND_HASH
+#define MINER_EARLY_SECOND_HASH 1
+#endif
+
+// Consecutive nonces hashed by each GPU thread per kernel launch.
+#ifndef MINER_NONCES_PER_THREAD
+#define MINER_NONCES_PER_THREAD 1
+#endif
 
 // ------------------------------------------------------------
 // SHA-256 constants
@@ -188,6 +217,175 @@ __device__ void sha256_transform_rolling(
     state[5] += f;
     state[6] += g;
     state[7] += h;
+}
+
+// Rounds [FirstRound, EndRound) of the same rolling-schedule compression as
+// sha256_transform_rolling, applied to the working variables v = {a..h}. The
+// caller supplies the starting variables and does the feed-forward addition.
+template <bool HasPrecomputedFirstWords, int FirstRound, int EndRound>
+__device__ __forceinline__ void sha256_rounds_rolling(
+    uint32_t v[8],
+    uint32_t schedule[16],
+    uint32_t precomputed_w16,
+    uint32_t precomputed_w17,
+    uint32_t precomputed_w18_base,
+    uint32_t precomputed_w19_base)
+{
+    uint32_t a = v[0];
+    uint32_t b = v[1];
+    uint32_t c = v[2];
+    uint32_t d = v[3];
+    uint32_t e = v[4];
+    uint32_t f = v[5];
+    uint32_t g = v[6];
+    uint32_t h = v[7];
+
+    #pragma unroll
+    for (int t = FirstRound; t < EndRound; t++) {
+        uint32_t word;
+
+        if (t < 16) {
+            word = schedule[t];
+        }
+        else {
+            const int slot = t & 15;
+            if (HasPrecomputedFirstWords && t == 16) {
+                word = precomputed_w16;
+            }
+            else if (HasPrecomputedFirstWords && t == 17) {
+                word = precomputed_w17;
+            }
+            else if (HasPrecomputedFirstWords && t == 18) {
+                word = precomputed_w18_base +
+                       sig0(schedule[(t - 15) & 15]);
+            }
+            else if (HasPrecomputedFirstWords && t == 19) {
+                word = precomputed_w19_base +
+                       schedule[(t - 16) & 15];
+            }
+            else {
+                word = sig1(schedule[(t - 2) & 15]) +
+                       schedule[(t - 7) & 15] +
+                       sig0(schedule[(t - 15) & 15]) +
+                       schedule[slot];
+            }
+            schedule[slot] = word;
+        }
+
+        uint32_t t1 = h + ep1(e) + ch(e, f, g) + K[t] + word;
+        uint32_t t2 = ep0(a) + maj(a, b, c);
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    v[0] = a;
+    v[1] = b;
+    v[2] = c;
+    v[3] = d;
+    v[4] = e;
+    v[5] = f;
+    v[6] = g;
+    v[7] = h;
+}
+
+// First hash, resumed after round 3.
+//
+// Round t of the second header block consumes message word W[t] only, and the
+// nonce is W[3]; W[0..2] are the Merkle-root tail, time and bits. So the
+// working variables after rounds 0-2 do not depend on the nonce. In round 3
+//
+//   T1 = h + ep1(e) + ch(e, f, g) + K[3] + W[3]     T2 = ep0(a) + maj(a, b, c)
+//
+// only the "+ W[3]" term involves the nonce. After round 3 therefore
+//
+//   a = (T1 - W[3] + T2) + W[3]      e = (d + T1 - W[3]) + W[3]
+//   b, c, d = old a, b, c            f, g, h = old e, f, g
+//
+// and resume_state holds those eight nonce-independent values, prepared once
+// per header by prepare_midstate_kernel.
+__device__ __forceinline__ void sha256_80_resumed(
+    const uint32_t tail_words[3],
+    uint32_t nonce_word,
+    const uint32_t midstate[8],
+    const uint32_t precomputed_schedule_words[4],
+    const uint32_t resume_state[8],
+    uint32_t first_hash_words[8])
+{
+    uint32_t schedule[16] = {0};
+
+    #pragma unroll
+    for (int i = 0; i < 3; i++)
+        schedule[i] = tail_words[i];
+
+    schedule[3] = nonce_word;
+    schedule[4] = 0x80000000;
+    schedule[15] = 0x00000280;
+
+    uint32_t v[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        v[i] = resume_state[i];
+    v[0] += nonce_word;
+    v[4] += nonce_word;
+
+    sha256_rounds_rolling<true, 4, 64>(
+        v,
+        schedule,
+        precomputed_schedule_words[0],
+        precomputed_schedule_words[1],
+        precomputed_schedule_words[2],
+        precomputed_schedule_words[3]
+    );
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        first_hash_words[i] = midstate[i] + v[i];
+}
+
+// Most significant 32 bits of the double hash, as the target comparison reads
+// them, from 61 of the second hash's 64 rounds.
+//
+// Rounds 61-63 only shift e to f, g and then h, so the value of e after round
+// 60 is h after round 63, and final word 7 is 0x5be0cd19 + that value. Word 7
+// holds the last four hash bytes, which are the most significant bytes of the
+// hash as a little-endian 256-bit number.
+__device__ __forceinline__ uint32_t sha256_32_top_word(
+    const uint32_t first_hash_words[8])
+{
+    uint32_t v[8] = {
+        0x6a09e667,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19
+    };
+
+    uint32_t schedule[16] = {0};
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        schedule[i] = first_hash_words[i];
+
+    schedule[8] = 0x80000000;
+    schedule[15] = 0x00000100;
+
+    sha256_rounds_rolling<false, 0, 61>(v, schedule, 0, 0, 0, 0);
+
+    uint32_t word = 0x5be0cd19 + v[4];
+    return (word >> 24) |
+           ((word >> 8) & 0x0000ff00) |
+           ((word << 8) & 0x00ff0000) |
+           (word << 24);
 }
 
 __device__ void sha256_80_from_midstate_words(
@@ -447,6 +645,45 @@ __global__ void prepare_midstate_kernel(
         sig1(precomputed_schedule_words[0]) + tail_words[2];
     precomputed_schedule_words[3] =
         sig1(precomputed_schedule_words[1]) + sig0(0x80000000);
+
+    // Nonce-independent state after round 3 of the first hash's second
+    // block; see sha256_80_resumed. Stored after the four schedule words.
+    uint32_t a = state[0];
+    uint32_t b = state[1];
+    uint32_t c = state[2];
+    uint32_t d = state[3];
+    uint32_t e = state[4];
+    uint32_t f = state[5];
+    uint32_t g = state[6];
+    uint32_t h = state[7];
+
+    #pragma unroll
+    for (int t = 0; t < 3; t++) {
+        uint32_t t1 = h + ep1(e) + ch(e, f, g) + K[t] + tail_words[t];
+        uint32_t t2 = ep0(a) + maj(a, b, c);
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    uint32_t t1_without_nonce = h + ep1(e) + ch(e, f, g) + K[3];
+    uint32_t t2 = ep0(a) + maj(a, b, c);
+
+    uint32_t *resume_state = precomputed_schedule_words + 4;
+    resume_state[0] = t1_without_nonce + t2;
+    resume_state[1] = a;
+    resume_state[2] = b;
+    resume_state[3] = c;
+    resume_state[4] = d + t1_without_nonce;
+    resume_state[5] = e;
+    resume_state[6] = f;
+    resume_state[7] = g;
 }
 
 __global__ void mine_kernel(
@@ -458,23 +695,82 @@ __global__ void mine_kernel(
     uint32_t nonce_count,
     uint32_t *found_nonce)
 {
-    uint32_t nonce_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (nonce_index >= nonce_count)
-        return;
+    // Per-scan inputs are read once per thread, not once per nonce.
+    uint32_t tail[3];
+    uint32_t mid[8];
+    uint32_t target[8];
+    uint32_t precomputed[4];
+    uint32_t resume_state[8];
 
-    uint32_t nonce = start_nonce + nonce_index;
-    uint32_t final_hash_words[8];
+    #pragma unroll
+    for (int i = 0; i < 3; i++)
+        tail[i] = tail_words[i];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        mid[i] = midstate[i];
+        target[i] = target_words[i];
+        resume_state[i] = precomputed_schedule_words[4 + i];
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        precomputed[i] = precomputed_schedule_words[i];
 
-    hash_header_nonce(
-        tail_words,
-        midstate,
-        precomputed_schedule_words,
-        nonce,
-        final_hash_words
-    );
+    const uint64_t first_index =
+        ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) *
+        MINER_NONCES_PER_THREAD;
 
-    if (hash_meets_target(final_hash_words, target_words))
-        atomicMin(found_nonce, nonce);
+    for (uint32_t i = 0; i < MINER_NONCES_PER_THREAD; i++) {
+        const uint64_t nonce_index = first_index + i;
+        if (nonce_index >= nonce_count)
+            return;
+
+        const uint32_t nonce = start_nonce + (uint32_t)nonce_index;
+        // Header bytes encode the nonce little-endian; SHA-256 reads big-endian words.
+        const uint32_t nonce_word =
+            ((nonce & 0x000000ff) << 24) |
+            ((nonce & 0x0000ff00) << 8) |
+            ((nonce & 0x00ff0000) >> 8) |
+            ((nonce & 0xff000000) >> 24);
+
+        uint32_t first_hash_words[8];
+#if MINER_RESUME_FIRST_HASH
+        sha256_80_resumed(
+            tail,
+            nonce_word,
+            mid,
+            precomputed,
+            resume_state,
+            first_hash_words
+        );
+#else
+        sha256_80_from_midstate_words(
+            tail,
+            nonce_word,
+            mid,
+            precomputed,
+            first_hash_words
+        );
+#endif
+
+#if MINER_EARLY_SECOND_HASH
+        // target[0] is the target's most significant word, so this decides
+        // every case except equality exactly as the full comparison would.
+        const uint32_t top_word = sha256_32_top_word(first_hash_words);
+        if (top_word > target[0])
+            continue;
+        if (top_word < target[0]) {
+            atomicMin(found_nonce, nonce);
+            continue;
+        }
+        // Equal most significant words: the lower words decide, so finish the
+        // hash and run the unchanged full 256-bit comparison.
+#endif
+        uint32_t final_hash_words[8];
+        sha256_32_from_words(first_hash_words, final_hash_words);
+
+        if (hash_meets_target(final_hash_words, target))
+            atomicMin(found_nonce, nonce);
+    }
 }
 
 __global__ void verify_nonce_kernel(
@@ -494,9 +790,286 @@ __global__ void verify_nonce_kernel(
         );
 }
 
+struct DeviceBuffers {
+    uint8_t *header = nullptr;
+    uint32_t *tail_words = nullptr;
+    uint32_t *target_words = nullptr;
+    uint32_t *result = nullptr;
+    uint32_t *midstate = nullptr;
+    uint32_t *precomputed_schedule_words = nullptr;
+    uint32_t *hash_words = nullptr;
+};
+
+bool cuda_ok(cudaError_t err, const char *what)
+{
+    if (err == cudaSuccess)
+        return true;
+
+    std::cerr
+        << "CUDA " << what << " error: "
+        << cudaGetErrorString(err)
+        << "\n";
+    return false;
+}
+
+// Allocated once per process and reused for every header and nonce range.
+bool allocate_device_buffers(DeviceBuffers &device)
+{
+    return
+        cuda_ok(cudaMalloc(&device.header, 80), "allocation") &&
+        cuda_ok(cudaMalloc(&device.tail_words, 3 * sizeof(uint32_t)), "allocation") &&
+        cuda_ok(cudaMalloc(&device.target_words, 8 * sizeof(uint32_t)), "allocation") &&
+        cuda_ok(cudaMalloc(&device.result, sizeof(uint32_t)), "allocation") &&
+        cuda_ok(cudaMalloc(&device.midstate, 8 * sizeof(uint32_t)), "allocation") &&
+        // Four schedule words followed by the eight resume-state words.
+        cuda_ok(cudaMalloc(&device.precomputed_schedule_words, 12 * sizeof(uint32_t)), "allocation") &&
+        cuda_ok(cudaMalloc(&device.hash_words, 8 * sizeof(uint32_t)), "allocation");
+}
+
+void free_device_buffers(DeviceBuffers &device)
+{
+    cudaFree(device.header);
+    cudaFree(device.tail_words);
+    cudaFree(device.target_words);
+    cudaFree(device.result);
+    cudaFree(device.midstate);
+    cudaFree(device.precomputed_schedule_words);
+    cudaFree(device.hash_words);
+    device = DeviceBuffers();
+}
+
+// Upload one header, its target and its midstate. Every nonce range of that
+// header can then be scanned without repeating this work.
+bool load_header(
+    const DeviceBuffers &device,
+    const uint8_t header[80],
+    uint8_t target[32])
+{
+    uint32_t bits = read_le32(header + 72);
+
+    if (!compact_bits_to_target(bits, target)) {
+        std::cerr << "Invalid compact target in nBits.\n";
+        return false;
+    }
+
+    uint32_t tail_words[3] = {
+        read_be32(header + 64),
+        read_be32(header + 68),
+        read_be32(header + 72)
+    };
+    uint32_t target_words[8];
+    for (int i = 0; i < 8; i++) {
+        int offset = 31 - i * 4;
+        target_words[i] =
+            ((uint32_t)target[offset] << 24) |
+            ((uint32_t)target[offset - 1] << 16) |
+            ((uint32_t)target[offset - 2] << 8) |
+            (uint32_t)target[offset - 3];
+    }
+
+    if (!cuda_ok(
+            cudaMemcpy(device.header, header, 80, cudaMemcpyHostToDevice),
+            "header upload") ||
+        !cuda_ok(
+            cudaMemcpy(
+                device.tail_words,
+                tail_words,
+                sizeof(tail_words),
+                cudaMemcpyHostToDevice
+            ),
+            "header upload") ||
+        !cuda_ok(
+            cudaMemcpy(
+                device.target_words,
+                target_words,
+                sizeof(target_words),
+                cudaMemcpyHostToDevice
+            ),
+            "target upload"))
+        return false;
+
+    prepare_midstate_kernel<<<1, 1>>>(
+        device.header,
+        device.tail_words,
+        device.midstate,
+        device.precomputed_schedule_words
+    );
+
+    return cuda_ok(cudaGetLastError(), "midstate kernel") &&
+           cuda_ok(cudaDeviceSynchronize(), "midstate preparation");
+}
+
+// Scan [start, start + count) of the loaded header. found_nonce is 0xffffffff
+// when no nonce met the target; otherwise found_hash_words holds its hash.
+bool scan_range(
+    const DeviceBuffers &device,
+    uint32_t start,
+    uint32_t count,
+    uint32_t *found_nonce,
+    uint32_t found_hash_words[8])
+{
+    uint32_t initial_result = 0xffffffff;
+
+    if (!cuda_ok(
+            cudaMemcpy(
+                device.result,
+                &initial_result,
+                sizeof(uint32_t),
+                cudaMemcpyHostToDevice
+            ),
+            "result reset"))
+        return false;
+
+    const int threads = 256;
+    const uint64_t nonces_per_block =
+        (uint64_t)threads * MINER_NONCES_PER_THREAD;
+    const unsigned blocks = static_cast<unsigned>(
+        ((uint64_t)count + nonces_per_block - 1) / nonces_per_block
+    );
+
+    mine_kernel<<<blocks, threads>>>(
+        device.tail_words,
+        device.target_words,
+        device.midstate,
+        device.precomputed_schedule_words,
+        start,
+        count,
+        device.result
+    );
+
+    if (!cuda_ok(cudaGetLastError(), "scan") ||
+        !cuda_ok(cudaDeviceSynchronize(), "scan") ||
+        !cuda_ok(
+            cudaMemcpy(
+                found_nonce,
+                device.result,
+                sizeof(uint32_t),
+                cudaMemcpyDeviceToHost
+            ),
+            "result download"))
+        return false;
+
+    if (*found_nonce == 0xffffffff)
+        return true;
+
+    verify_nonce_kernel<<<1, 1>>>(
+        device.tail_words,
+        device.midstate,
+        device.precomputed_schedule_words,
+        *found_nonce,
+        device.hash_words
+    );
+
+    return cuda_ok(cudaGetLastError(), "hash verification") &&
+           cuda_ok(cudaDeviceSynchronize(), "hash verification") &&
+           cuda_ok(
+               cudaMemcpy(
+                   found_hash_words,
+                   device.hash_words,
+                   8 * sizeof(uint32_t),
+                   cudaMemcpyDeviceToHost
+               ),
+               "hash download");
+}
+
+void print_scan_result(uint32_t found_nonce, const uint32_t found_hash_words[8])
+{
+    if (found_nonce == 0xffffffff) {
+        std::printf("NONE\n");
+    }
+    else {
+        std::printf("FOUND %u ", found_nonce);
+        for (int i = 7; i >= 0; i--) {
+            for (int byte = 0; byte < 4; byte++)
+                std::printf(
+                    "%02x",
+                    static_cast<unsigned>(
+                        (found_hash_words[i] >> (byte * 8)) & 0xff
+                    )
+                );
+        }
+        std::printf("\n");
+    }
+    std::fflush(stdout);
+}
+
+bool valid_scan_range(uint32_t start, uint32_t count)
+{
+    return count != 0 && (uint64_t)start + count <= 0x100000000ULL;
+}
+
+// Persistent mode. One request per stdin line:
+//
+//   SCAN <id> <80-byte-hex> <start> <count>
+//
+// and exactly one stdout line in reply, echoing the request id:
+//
+//   <id> NONE
+//   <id> FOUND <nonce> <hash>
+//
+// End of input ends the session. Any malformed request or CUDA error is
+// reported on stderr and ends the process with a nonzero status and no reply.
+int serve(DeviceBuffers &device)
+{
+    std::printf("READY\n");
+    std::fflush(stdout);
+
+    uint8_t loaded_header[80];
+    bool header_loaded = false;
+    std::string line;
+
+    while (std::getline(std::cin, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+
+        std::istringstream fields(line);
+        std::string command, id_text, header_hex, start_text, count_text, extra;
+        fields >> command >> id_text >> header_hex >> start_text >> count_text;
+
+        uint8_t header[80];
+        uint32_t request_id = 0;
+        uint32_t start = 0;
+        uint32_t count = 0;
+
+        if (command != "SCAN" ||
+            (fields >> extra) ||
+            !parse_uint32(id_text.c_str(), &request_id) ||
+            !parse_header_hex(header_hex.c_str(), header) ||
+            !parse_uint32(start_text.c_str(), &start) ||
+            !parse_uint32(count_text.c_str(), &count) ||
+            !valid_scan_range(start, count)) {
+            std::cerr << "Malformed request; expected: "
+                      << "SCAN <id> <80-byte-hex> <start> <count>\n";
+            return 2;
+        }
+
+        // The nonce bytes are replaced on the GPU, so only the first 76
+        // bytes identify the work already prepared on the device.
+        if (!header_loaded || std::memcmp(header, loaded_header, 76) != 0) {
+            uint8_t target[32];
+            header_loaded = false;
+            if (!load_header(device, header, target))
+                return 1;
+            std::memcpy(loaded_header, header, 80);
+            header_loaded = true;
+        }
+
+        uint32_t found_nonce;
+        uint32_t found_hash_words[8];
+        if (!scan_range(device, start, count, &found_nonce, found_hash_words))
+            return 1;
+
+        std::printf("%u ", request_id);
+        print_scan_result(found_nonce, found_hash_words);
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     bool scan_mode = false;
+    bool serve_mode = false;
     uint32_t scan_start = 0;
     uint32_t scan_count = 0;
     uint8_t header[80] = {0};
@@ -508,8 +1081,7 @@ int main(int argc, char **argv)
         if (!parse_header_hex(argv[2], header) ||
             !parse_uint32(argv[4], &scan_start) ||
             !parse_uint32(argv[6], &scan_count) ||
-            scan_count == 0 ||
-            (uint64_t)scan_start + scan_count > 0x100000000ULL) {
+            !valid_scan_range(scan_start, scan_count)) {
             std::cerr
                 << "Usage: cuda_miner --scan-header <80-byte-hex> "
                 << "--start <uint32> --count <1..uint32>\n";
@@ -517,11 +1089,29 @@ int main(int argc, char **argv)
         }
         scan_mode = true;
     }
+    else if (argc == 2 && std::strcmp(argv[1], "--serve") == 0) {
+        serve_mode = true;
+    }
     else if (argc != 1) {
         std::cerr
-            << "Usage: cuda_miner [--scan-header <80-byte-hex> "
+            << "Usage: cuda_miner [--serve | --scan-header <80-byte-hex> "
             << "--start <uint32> --count <1..uint32>]\n";
         return 2;
+    }
+
+    // Sleep while a kernel runs instead of spinning a CPU core. Host-side
+    // only; on a thermally limited laptop the idle core leaves the GPU more
+    // power, which measured as higher sustained throughput.
+    cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+
+    DeviceBuffers device;
+    if (!allocate_device_buffers(device))
+        return 1;
+
+    if (serve_mode) {
+        int status = serve(device);
+        free_device_buffers(device);
+        return status;
     }
 
     // Same synthetic header used by our CPU benchmark:
@@ -544,199 +1134,49 @@ int main(int argc, char **argv)
         memcpy(header + 72, &bits, 4);
     }
 
-    uint32_t bits = read_le32(header + 72);
-
     uint8_t target[32];
-    if (!compact_bits_to_target(bits, target)) {
-        std::cerr << "Invalid compact target in nBits.\n";
+    if (!load_header(device, header, target))
         return 1;
-    }
 
-    uint32_t tail_words[3] = {
-        read_be32(header + 64),
-        read_be32(header + 68),
-        read_be32(header + 72)
-    };
-    uint32_t target_words[8];
-    for (int i = 0; i < 8; i++) {
-        int offset = 31 - i * 4;
-        target_words[i] =
-            ((uint32_t)target[offset] << 24) |
-            ((uint32_t)target[offset - 1] << 16) |
-            ((uint32_t)target[offset - 2] << 8) |
-            (uint32_t)target[offset - 3];
-    }
+    if (scan_mode) {
+        uint32_t found_nonce;
+        uint32_t found_hash_words[8];
+        if (!scan_range(
+                device,
+                scan_start,
+                scan_count,
+                &found_nonce,
+                found_hash_words))
+            return 1;
 
-    uint8_t *device_header = nullptr;
-    uint32_t *device_tail_words = nullptr;
-    uint32_t *device_target_words = nullptr;
-    uint32_t *device_result = nullptr;
-    uint32_t *device_midstate = nullptr;
-    uint32_t *device_precomputed_schedule_words = nullptr;
-    uint32_t *device_hash_words = nullptr;
-
-    cudaMalloc(&device_header, 80);
-    cudaMalloc(&device_tail_words, sizeof(tail_words));
-    cudaMalloc(&device_target_words, sizeof(target_words));
-    cudaMalloc(&device_result, sizeof(uint32_t));
-    cudaMalloc(&device_midstate, 8 * sizeof(uint32_t));
-    cudaMalloc(&device_precomputed_schedule_words, 4 * sizeof(uint32_t));
-    cudaMalloc(&device_hash_words, 8 * sizeof(uint32_t));
-
-    cudaMemcpy(
-        device_header,
-        header,
-        80,
-        cudaMemcpyHostToDevice
-    );
-
-    cudaMemcpy(
-        device_tail_words,
-        tail_words,
-        sizeof(tail_words),
-        cudaMemcpyHostToDevice
-    );
-
-    cudaMemcpy(
-        device_target_words,
-        target_words,
-        sizeof(target_words),
-        cudaMemcpyHostToDevice
-    );
-
-    prepare_midstate_kernel<<<1, 1>>>(
-        device_header,
-        device_tail_words,
-        device_midstate,
-        device_precomputed_schedule_words
-    );
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr
-            << "CUDA midstate kernel error: "
-            << cudaGetErrorString(err)
-            << "\n";
-        return 1;
-    }
-
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        std::cerr
-            << "CUDA midstate preparation error: "
-            << cudaGetErrorString(err)
-            << "\n";
-        return 1;
+        print_scan_result(found_nonce, found_hash_words);
+        free_device_buffers(device);
+        return 0;
     }
 
     uint32_t initial_result = 0xffffffff;
 
     cudaMemcpy(
-        device_result,
+        device.result,
         &initial_result,
         sizeof(uint32_t),
         cudaMemcpyHostToDevice
     );
-
-    if (scan_mode) {
-        const int threads = 256;
-        const unsigned blocks = static_cast<unsigned>(
-            ((uint64_t)scan_count + threads - 1) / threads
-        );
-
-        mine_kernel<<<blocks, threads>>>(
-            device_tail_words,
-            device_target_words,
-            device_midstate,
-            device_precomputed_schedule_words,
-            scan_start,
-            scan_count,
-            device_result
-        );
-
-        cudaError_t scan_error = cudaGetLastError();
-        if (scan_error == cudaSuccess)
-            scan_error = cudaDeviceSynchronize();
-        if (scan_error != cudaSuccess) {
-            std::cerr
-                << "CUDA scan error: "
-                << cudaGetErrorString(scan_error)
-                << "\n";
-            return 1;
-        }
-
-        uint32_t found_nonce;
-        cudaMemcpy(
-            &found_nonce,
-            device_result,
-            sizeof(uint32_t),
-            cudaMemcpyDeviceToHost
-        );
-
-        if (found_nonce == 0xffffffff) {
-            std::cout << "NONE\n";
-        }
-        else {
-            verify_nonce_kernel<<<1, 1>>>(
-                device_tail_words,
-                device_midstate,
-                device_precomputed_schedule_words,
-                found_nonce,
-                device_hash_words
-            );
-
-            scan_error = cudaGetLastError();
-            if (scan_error == cudaSuccess)
-                scan_error = cudaDeviceSynchronize();
-            if (scan_error != cudaSuccess) {
-                std::cerr
-                    << "CUDA hash verification error: "
-                    << cudaGetErrorString(scan_error)
-                    << "\n";
-                return 1;
-            }
-
-            uint32_t found_hash_words[8];
-            cudaMemcpy(
-                found_hash_words,
-                device_hash_words,
-                sizeof(found_hash_words),
-                cudaMemcpyDeviceToHost
-            );
-
-            std::cout << "FOUND " << found_nonce << " ";
-            for (int i = 7; i >= 0; i--) {
-                for (int byte = 0; byte < 4; byte++)
-                    std::printf(
-                        "%02x",
-                        static_cast<unsigned>(
-                            (found_hash_words[i] >> (byte * 8)) & 0xff
-                        )
-                    );
-            }
-            std::cout << "\n";
-        }
-
-        cudaFree(device_header);
-        cudaFree(device_tail_words);
-        cudaFree(device_target_words);
-        cudaFree(device_result);
-        cudaFree(device_midstate);
-        cudaFree(device_precomputed_schedule_words);
-        cudaFree(device_hash_words);
-        return 0;
-    }
 
     const uint32_t nonce_count = 500000000;
     const uint32_t warmup_nonce_count = 1000000;
     const int measured_runs = 5;
 
     const int threads = 256;
+    const uint64_t nonces_per_block =
+        (uint64_t)threads * MINER_NONCES_PER_THREAD;
     const unsigned blocks = static_cast<unsigned>(
-        ((uint64_t)nonce_count + threads - 1) / threads
+        ((uint64_t)nonce_count + nonces_per_block - 1) / nonces_per_block
     );
-    const unsigned warmup_blocks =
-        (warmup_nonce_count + threads - 1) / threads;
+    const unsigned warmup_blocks = static_cast<unsigned>(
+        ((uint64_t)warmup_nonce_count + nonces_per_block - 1) /
+        nonces_per_block
+    );
 
     cudaEvent_t start;
     cudaEvent_t stop;
@@ -745,16 +1185,16 @@ int main(int argc, char **argv)
     cudaEventCreate(&stop);
 
     mine_kernel<<<warmup_blocks, threads>>>(
-        device_tail_words,
-        device_target_words,
-        device_midstate,
-        device_precomputed_schedule_words,
+        device.tail_words,
+        device.target_words,
+        device.midstate,
+        device.precomputed_schedule_words,
         0,
         warmup_nonce_count,
-        device_result
+        device.result
     );
 
-    err = cudaGetLastError();
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         std::cerr
             << "CUDA warm-up error: "
@@ -774,7 +1214,7 @@ int main(int argc, char **argv)
     float run_milliseconds[5];
     for (int run = 0; run < measured_runs; run++) {
         cudaMemcpy(
-            device_result,
+            device.result,
             &initial_result,
             sizeof(uint32_t),
             cudaMemcpyHostToDevice
@@ -782,13 +1222,13 @@ int main(int argc, char **argv)
 
         cudaEventRecord(start);
         mine_kernel<<<blocks, threads>>>(
-            device_tail_words,
-            device_target_words,
-            device_midstate,
-            device_precomputed_schedule_words,
+            device.tail_words,
+            device.target_words,
+            device.midstate,
+            device.precomputed_schedule_words,
             0,
             nonce_count,
-            device_result
+            device.result
         );
 
         err = cudaGetLastError();
@@ -823,7 +1263,7 @@ int main(int argc, char **argv)
     uint32_t found_nonce;
     cudaMemcpy(
         &found_nonce,
-        device_result,
+        device.result,
         sizeof(uint32_t),
         cudaMemcpyDeviceToHost
     );
@@ -831,11 +1271,11 @@ int main(int argc, char **argv)
     uint32_t found_hash_words[8];
     if (found_nonce != 0xffffffff) {
         verify_nonce_kernel<<<1, 1>>>(
-            device_tail_words,
-            device_midstate,
-            device_precomputed_schedule_words,
+            device.tail_words,
+            device.midstate,
+            device.precomputed_schedule_words,
             found_nonce,
-            device_hash_words
+            device.hash_words
         );
 
         err = cudaGetLastError();
@@ -849,7 +1289,7 @@ int main(int argc, char **argv)
 
         cudaMemcpy(
             found_hash_words,
-            device_hash_words,
+            device.hash_words,
             sizeof(found_hash_words),
             cudaMemcpyDeviceToHost
         );
@@ -898,13 +1338,7 @@ int main(int argc, char **argv)
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    cudaFree(device_header);
-    cudaFree(device_tail_words);
-    cudaFree(device_target_words);
-    cudaFree(device_result);
-    cudaFree(device_midstate);
-    cudaFree(device_precomputed_schedule_words);
-    cudaFree(device_hash_words);
+    free_device_buffers(device);
 
     return 0;
 }
