@@ -204,6 +204,7 @@ def miner_args(**overrides) -> argparse.Namespace:
         monitor_interval=15.0,
         recovery_timeout=3600.0,
         monitor_block=None,
+        version_rolling=False,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -2685,6 +2686,237 @@ class CudaKernelAgainstCpuTests(unittest.TestCase):
         self.assertIn(expected[1], benchmark.stdout)
 
 
+def rolled_header(header: bytes, nonce: int, variant: int) -> bytes:
+    """The header with `variant` added to its BIP 320 version field (bits 13-28)."""
+    version = struct.unpack("<I", header[:4])[0] + (variant << 13)
+    return struct.pack("<I", version) + header[4:76] + struct.pack("<I", nonce)
+
+
+def cpu_lowest_rolled(
+    header: bytes, start: int, count: int, versions: int, first_variant: int = 0
+) -> tuple[int, str, int] | None:
+    """Lowest nonce, then lowest version variant, whose SHA256d meets the header's nBits."""
+    target = bits_to_target(struct.unpack("<I", header[72:76])[0])
+    for nonce in range(start, start + count):
+        for variant in range(first_variant, versions):
+            digest = double_sha256(rolled_header(header, nonce, variant))
+            if int.from_bytes(digest[::-1], "big") <= target:
+                return nonce, digest[::-1].hex(), variant
+    return None
+
+
+def cpu_rolled_responder(fields: list[str]) -> str:
+    if fields[0] == "SCAN":
+        return cpu_scan_responder(fields)
+    _command, request_id, header_hex, start, count, versions = fields
+    result = cpu_lowest_rolled(
+        bytes.fromhex(header_hex), int(start), int(count), int(versions)
+    )
+    if result is None:
+        return f"{request_id} NONE\n"
+    return f"{request_id} FOUND {result[0]} {result[1]} {result[2]}\n"
+
+
+@unittest.skipUnless(CUDA_MINER.is_file(), "Build cuda_miner.exe to run this vector")
+class VersionRollingKernelTests(unittest.TestCase):
+    """SCANV must agree with hashlib for every variant, nonce and target shape.
+
+    Every expectation is computed on the CPU from the rolled 80-byte header,
+    so a kernel that skipped, repeated or mislabelled a variant would differ.
+    """
+
+    VERSION_COUNTS = (2, 4, 8, 16)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.miner = CudaMiner(CUDA_MINER)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        process = cls.miner.process
+        cls.miner.close()
+        if process is not None:
+            assert process.returncode == 0, process.returncode
+
+    def assert_scan_matches_cpu(
+        self, header: bytes, start: int, count: int, versions: int
+    ) -> tuple[int, str, int] | None:
+        expected = cpu_lowest_rolled(header, start, count, versions)
+        self.assertEqual(
+            self.miner.scan(header, start, count, versions),
+            expected,
+            f"bits={header[72:76][::-1].hex()} start={start} count={count} "
+            f"versions={versions}",
+        )
+        return expected
+
+    def test_randomized_headers_targets_ranges_and_version_counts(self) -> None:
+        rng = random.Random(320)
+        pool = (
+            0x207FFFFF, 0x2000FFFF, 0x1F7FFFFF, 0x1F00FFFF, 0x1F0000FF, 0x1E7FFFFF,
+            0x1E00FFFF, 0x1D00FFFF, 0x1F123456, 0x20000001, 0x2012AB00, 0x1F00FF01,
+        )
+        found = 0
+        variants = set()
+        for _ in range(80):
+            bits = rng.choice(pool)
+            versions = rng.choice(self.VERSION_COUNTS)
+            version = rng.getrandbits(32) & ~(0xFFFF << 13)
+            header = (
+                struct.pack("<I", version) + rng.randbytes(68)
+                + struct.pack("<I", bits) + bytes(4)
+            )
+            start = rng.choice(
+                (0, rng.randrange(1 << 31), 0xFFFFFFFF - rng.randrange(0, 5000))
+            )
+            count = min(
+                rng.choice((1, 2, 3, 5, 7, 31, 255, 257, 1000)),
+                0x100000000 - start,
+            )
+            with self.subTest(bits=f"{bits:08x}", start=start, count=count, versions=versions):
+                expected = self.assert_scan_matches_cpu(header, start, count, versions)
+                if expected is not None:
+                    found += 1
+                    variants.add(expected[2])
+        # The fixed seed gives hits and misses, and hits on rolled versions.
+        self.assertTrue(10 <= found <= 70, found)
+        self.assertGreater(len(variants), 3, variants)
+
+    def test_every_variant_is_hashed_from_its_own_rolled_header(self) -> None:
+        # About one hash in sixteen qualifies, so over single-nonce scans each
+        # of the sixteen variants is, sooner or later, the lowest one that does.
+        header = (
+            struct.pack("<I", 0x20000000) + hashlib.sha256(b"variants").digest() * 2
+            + struct.pack("<II", 1_791_500_000, 0x200FFFFF) + bytes(4)
+        )
+        reported = set()
+        for nonce in range(400):
+            expected = self.assert_scan_matches_cpu(header, nonce, 1, 16)
+            if expected is not None:
+                reported.add(expected[2])
+        self.assertEqual(reported, set(range(16)))
+
+    def test_fewer_versions_never_report_a_higher_variant(self) -> None:
+        header = (
+            struct.pack("<I", 0x20000000) + hashlib.sha256(b"prefix").digest() * 2
+            + struct.pack("<II", 1_791_500_000, 0x1F7FFFFF) + bytes(4)
+        )
+        for versions in self.VERSION_COUNTS:
+            with self.subTest(versions=versions):
+                expected = self.assert_scan_matches_cpu(header, 0, 3000, versions)
+                self.assertIsNotNone(expected)
+                self.assertLess(expected[2], versions)
+
+    def test_top_word_equal_cases_fall_back_to_the_full_comparison(self) -> None:
+        # Variant 0 is the unrolled header, so the pinned equality cases of
+        # the plain kernel must be decided the same way by this one.
+        accepted = 0
+        for bits, seed, nonce, qualifies in CudaKernelAgainstCpuTests.TOP_WORD_EQUAL:
+            with self.subTest(bits=f"{bits:08x}", nonce=nonce):
+                header = CudaKernelAgainstCpuTests.equality_header(seed, bits)
+                digest = double_sha256(header[:76] + struct.pack("<I", nonce))
+                for versions in (2, 16):
+                    result = self.assert_scan_matches_cpu(header, nonce, 1, versions)
+                    if qualifies:
+                        self.assertEqual(result, (nonce, digest[::-1].hex(), 0))
+                        accepted += 1
+                self.assert_scan_matches_cpu(header, nonce - 3, 7, 4)
+        self.assertEqual(accepted, 12)
+
+    def test_end_of_nonce_space_is_reported_by_the_gpu(self) -> None:
+        # The plain scan cannot report nonce 0xffffffff (its "nothing found"
+        # value); the version scan has no such value and must report it.
+        for versions in self.VERSION_COUNTS:
+            with self.subTest(versions=versions):
+                # Half of all hashes meet this target; take a header whose
+                # last nonce is a hit, as established on the CPU.
+                header = next(
+                    candidate
+                    for candidate in (
+                        struct.pack("<I", 0x20000000) + bytes([seed]) * 68
+                        + struct.pack("<I", 0x207FFFFF) + bytes(4)
+                        for seed in range(256)
+                    )
+                    if cpu_lowest_rolled(candidate, 0xFFFFFFFF, 1, versions) is not None
+                )
+                expected = self.assert_scan_matches_cpu(header, 0xFFFFFFFF, 1, versions)
+                self.assertEqual(expected[0], 0xFFFFFFFF)
+        for bits, start, count in (
+            (0x1F7FFFFF, 0xFFFFFFF0, 16),
+            (0x1F7FFFFF, 0xFFFFFF00, 256),
+            (0x1F00FFFF, 0xFFFFF000, 4096),
+            (0x1D00FFFF, 0xFFFFFFFE, 2),
+        ):
+            with self.subTest(start=start, count=count):
+                header = (
+                    struct.pack("<I", 0x20000000) + bytes(range(8, 76))
+                    + struct.pack("<I", bits) + bytes(4)
+                )
+                self.assert_scan_matches_cpu(header, start, count, 4)
+
+    def test_range_boundaries_around_a_hit(self) -> None:
+        header = (
+            struct.pack("<I", 0x20000000) + bytes(range(68))
+            + struct.pack("<I", 0x1F00FFFF) + bytes(4)
+        )
+        first = cpu_lowest_rolled(header, 0, 40_000, 4)
+        self.assertIsNotNone(first)
+        nonce = first[0]
+        self.assertEqual(self.miner.scan(header, 0, 40_000, 4), first)
+        self.assertEqual(self.miner.scan(header, nonce, 1, 4), first)
+        # The range ends one nonce before the hit, for lengths that do not
+        # divide evenly into the kernel's blocks.
+        for length in (1, 2, 3, 15, 16, 17, 33, 255, 257, 1023):
+            with self.subTest(length=length):
+                if nonce >= length:
+                    self.assertIsNone(self.miner.scan(header, nonce - length, length, 4))
+                    self.assertEqual(
+                        self.miner.scan(header, nonce - length, length + 1, 4), first
+                    )
+
+    def test_plain_and_version_scans_share_one_loaded_header(self) -> None:
+        header = (
+            struct.pack("<I", 0x20000000) + hashlib.sha256(b"shared").digest() * 2
+            + struct.pack("<II", 1_791_500_000, 0x1F7FFFFF) + bytes(4)
+        )
+        other = header[:40] + bytes(4) + header[44:]
+        plain = cpu_lowest_nonce(header, 0, 3000)
+        self.assertEqual(self.miner.scan(header, 0, 3000), plain)
+        self.assert_scan_matches_cpu(header, 0, 3000, 4)
+        self.assertEqual(self.miner.scan(header, 0, 3000), plain)
+        self.assert_scan_matches_cpu(header, 0, 3000, 8)
+        # New work replaces every variant's state, not only the plain one.
+        self.assert_scan_matches_cpu(other, 0, 3000, 8)
+        self.assert_scan_matches_cpu(header, 0, 3000, 8)
+        self.assertEqual(self.miner.scan(other, 0, 3000), cpu_lowest_nonce(other, 0, 3000))
+
+    def test_unsupported_version_requests_fail_closed(self) -> None:
+        clear = (bytes(72) + struct.pack("<I", 0x207FFFFF) + bytes(4)).hex()
+        rolled = (
+            struct.pack("<I", 1 << 13) + bytes(68) + struct.pack("<I", 0x207FFFFF) + bytes(4)
+        ).hex()
+        for request in (
+            f"SCANV 1 {clear} 0 1 3",
+            f"SCANV 1 {clear} 0 1 1",
+            f"SCANV 1 {clear} 0 1",
+            f"SCANV 1 {clear} 0 1 4 4",
+            f"SCANV 1 {rolled} 0 1 4",
+            f"SCAN 1 {clear} 0 1 4",
+        ):
+            with self.subTest(request=request[:8] + request[-8:]):
+                result = subprocess.run(
+                    [str(CUDA_MINER), "--serve"],
+                    input=request + "\n",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "READY\n")
+                self.assertIn("Malformed request", result.stderr)
+
+
 class TransactionHashTests(unittest.TestCase):
     def test_legacy_transaction_id_and_witness_id_match(self) -> None:
         txid, wtxid = transaction_hashes(bytes.fromhex(LEGACY_TRANSACTION))
@@ -3146,6 +3378,271 @@ class ExtranonceRollingTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertFalse(prefetcher.ready())
         self.assertIsNone(prefetcher.take())
+
+
+class VersionRollingTests(unittest.TestCase):
+    """--version-rolling: the runner's side of SCANV, with every RPC mocked."""
+
+    HEADER = bytes(4) + bytes(range(4, 80))
+
+    def run_block(self, core, process, **kwargs):
+        self.output = io.StringIO()
+        with (
+            patch("regtest_miner.rpc", side_effect=core),
+            patch("regtest_miner.subprocess.Popen", return_value=process),
+            patch("regtest_miner.save_unsubmitted_block", return_value=None),
+            redirect_stdout(self.output),
+        ):
+            miner = CudaMiner(Path("cuda_miner.exe"))
+            return mine_one_block(
+                Path("bitcoin-cli.exe"), miner, "mainnet", None, None, 50, 7,
+                bytes.fromhex(PAYOUT_SCRIPT), live_mainnet=True,
+                payout_address=PAYOUT_ADDRESS, **kwargs,
+            )
+
+    @staticmethod
+    def rolled_only_responder(fields: list[str]) -> str:
+        """Report the lowest hit on a rolled version, never on the template's own."""
+        _command, request_id, header_hex, start, count, versions = fields
+        nonce, displayed, variant = cpu_lowest_rolled(
+            bytes.fromhex(header_hex), int(start), int(count), int(versions), 1
+        )
+        return f"{request_id} FOUND {nonce} {displayed} {variant}\n"
+
+    def test_flag_is_off_by_default_and_parsed(self) -> None:
+        with patch("sys.argv", ["regtest_miner.py"]):
+            self.assertFalse(parse_args().version_rolling)
+        with patch("sys.argv", ["regtest_miner.py", "--version-rolling"]):
+            self.assertTrue(parse_args().version_rolling)
+
+    def test_request_and_reply_name_the_version_variant(self) -> None:
+        process = FakeCudaProcess(lambda fields: f"{fields[1]} FOUND 7 {'ab' * 32} 3\n")
+        with patch("regtest_miner.subprocess.Popen", return_value=process):
+            miner = CudaMiner(Path("cuda_miner.exe"))
+            self.assertEqual(miner.scan(self.HEADER, 0, 10, 4), (7, "ab" * 32, 3))
+        self.assertEqual(process.requests, [f"SCANV 1 {self.HEADER.hex()} 0 10 4\n"])
+
+    def test_reply_without_a_valid_variant_fails_closed(self) -> None:
+        for versions, reply in (
+            (4, f"FOUND 7 {'ab' * 32}"),
+            (4, f"FOUND 7 {'ab' * 32} 4"),
+            (4, f"FOUND 7 {'ab' * 32} -1"),
+            (4, f"FOUND 7 {'ab' * 32} x"),
+            (4, f"FOUND 7 {'ab' * 32} 1 1"),
+            (1, f"FOUND 7 {'ab' * 32} 0"),
+        ):
+            with self.subTest(versions=versions, reply=reply[-6:]):
+                process = FakeCudaProcess(lambda fields, reply=reply: f"{fields[1]} {reply}\n")
+                with patch("regtest_miner.subprocess.Popen", return_value=process):
+                    miner = CudaMiner(Path("cuda_miner.exe"))
+                    with self.assertRaisesRegex(RuntimeError, "Unexpected CUDA miner output"):
+                        miner.scan(self.HEADER, 0, 10, versions)
+                self.assertTrue(miner.failed)
+                self.assertTrue(process.killed)
+
+    def test_nonce_range_is_covered_once_for_all_variants(self) -> None:
+        process = FakeCudaProcess()
+        with (
+            patch("regtest_miner.subprocess.Popen", return_value=process),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            miner = CudaMiner(Path("cuda_miner.exe"))
+            hard = self.HEADER[:72] + struct.pack("<I", 0x1D00FFFF) + bytes(4)
+            # 100 hashes per chunk is 25 nonces of 4 versions each.
+            self.assertIsNone(
+                find_nonce(miner, hard, 0x1D00FFFF, 100, 0, 109, lambda: False, version_count=4)
+            )
+            # Through the last nonce: the GPU reports it, no CPU check is needed.
+            easy = self.HEADER[:72] + struct.pack("<I", 0x207FFFFF) + bytes(4)
+            self.assertIsNone(
+                find_nonce(
+                    miner, easy, 0x207FFFFF, 100, 0xFFFFFFF0, 0xFFFFFFFF, lambda: False,
+                    version_count=4,
+                )
+            )
+        self.assertEqual(
+            [request.split()[0] for request in process.requests], ["SCANV"] * 6
+        )
+        self.assertEqual(
+            [tuple(map(int, request.split()[3:])) for request in process.requests],
+            [
+                (0, 25, 4), (25, 25, 4), (50, 25, 4), (75, 25, 4), (100, 10, 4),
+                (0xFFFFFFF0, 16, 4),
+            ],
+        )
+        # The status line counts hashes, not nonces.
+        self.assertIn("| 100 hashes (4 versions per nonce) |", output.getvalue())
+        self.assertIn("| 64 hashes (4 versions per nonce) |", output.getvalue())
+
+    def test_rolled_block_carries_the_variant_version_and_passes_every_check(self) -> None:
+        core = FakeCore()
+        process = FakeCudaProcess(self.rolled_only_responder)
+        self.assertTrue(self.run_block(core, process, version_rolling=True))
+
+        count = regtest_miner.VERSION_ROLL_COUNT
+        request = process.requests[0].split()
+        self.assertEqual(request[0], "SCANV")
+        self.assertEqual(request[3:], ["0", str(50 // count), str(count)])
+        requested = bytes.fromhex(request[2])
+        # The request holds the template's own version; the GPU rolls it.
+        self.assertEqual(struct.unpack("<I", requested[:4])[0], core.template["version"])
+
+        block = bytes.fromhex(core.submitted[0])
+        variant = (struct.unpack("<I", block[:4])[0] - core.template["version"]) >> 13
+        self.assertIn(variant, range(1, count))
+        self.assertEqual(
+            block[:4], struct.pack("<I", core.template["version"] + (variant << 13))
+        )
+        # Nothing but the version and the nonce differs from the requested header.
+        self.assertEqual(block[4:76], requested[4:76])
+        self.assertLessEqual(
+            int.from_bytes(double_sha256(block[:80])[::-1], "big"),
+            bits_to_target(0x207FFFFF),
+        )
+        legacy = bytes.fromhex(LEGACY_TRANSACTION)
+        coinbase = block[81 : len(block) - len(legacy)]
+        self.assertEqual(
+            transaction_outputs(coinbase),
+            [(5_000_000_000, bytes.fromhex(PAYOUT_SCRIPT))],
+        )
+        self.assertEqual(
+            block[36:68],
+            merkle_root([double_sha256(coinbase), bytes.fromhex(LEGACY_TXID)[::-1]]),
+        )
+        self.assertIn(f"version={block[:4][::-1].hex()}", self.output.getvalue())
+        self.assertIn(f"versions per nonce={count})", self.output.getvalue())
+
+    def test_hash_reported_for_the_wrong_variant_is_never_submitted(self) -> None:
+        core = FakeCore()
+
+        def wrong_variant(fields):
+            reply = self.rolled_only_responder(fields).split()
+            return " ".join(reply[:4] + [str(int(reply[4]) - 1)]) + "\n"
+
+        process = FakeCudaProcess(wrong_variant)
+        with self.assertRaisesRegex(RuntimeError, "does not match the CPU"):
+            self.run_block(core, process, version_rolling=True)
+        self.assertNotIn("submitblock", core.methods)
+
+    def test_template_that_uses_the_rolled_bits_is_mined_unrolled(self) -> None:
+        core = FakeCore(dict(easy_template(), version=0x20000000 | (1 << 20)))
+        process = FakeCudaProcess(cpu_rolled_responder)
+        self.assertTrue(self.run_block(core, process, version_rolling=True))
+
+        self.assertEqual([request.split()[0] for request in process.requests], ["SCAN"])
+        self.assertEqual(process.requests[0].split()[3:], ["0", "50"])
+        self.assertIn("version rolling is off for this template", self.output.getvalue())
+        self.assertNotIn("versions per nonce", self.output.getvalue())
+        block = bytes.fromhex(core.submitted[0])
+        self.assertEqual(block[:4], struct.pack("<I", 0x20000000 | (1 << 20)))
+
+    def test_without_the_flag_requests_and_blocks_are_unchanged(self) -> None:
+        core = FakeCore()
+        process = FakeCudaProcess(cpu_rolled_responder)
+        self.assertTrue(self.run_block(core, process))
+
+        self.assertEqual([request.split()[0] for request in process.requests], ["SCAN"])
+        self.assertEqual(process.requests[0].split()[3:], ["0", "50"])
+        self.assertEqual(
+            bytes.fromhex(core.submitted[0])[:4], struct.pack("<I", core.template["version"])
+        )
+        found_line = self.output.getvalue().split("CANDIDATE FOUND")[1].splitlines()[0]
+        self.assertNotIn("version", found_line)
+
+    def test_exhausted_nonce_space_rolls_the_extranonce_with_versions(self) -> None:
+        count = regtest_miner.VERSION_ROLL_COUNT
+        per_chunk = 50 // count
+        template = easy_template()
+        # Two chunks of nonces per header.
+        template["noncerange"] = f"00000000{2 * per_chunk - 1:08x}"
+
+        def third_request_finds(fields):
+            if fields[1] in ("1", "2"):
+                return f"{fields[1]} NONE\n"
+            return cpu_rolled_responder(fields)
+
+        core = FakeCore(template)
+        process = FakeCudaProcess(third_request_finds)
+        self.assertTrue(self.run_block(core, process, version_rolling=True))
+
+        headers = [bytes.fromhex(request.split()[2]) for request in process.requests]
+        # Two chunks exhaust the header, then a new coinbase gives a new
+        # Merkle root and the range starts again.
+        self.assertEqual(
+            [request.split()[3:] for request in process.requests],
+            [
+                ["0", str(per_chunk), str(count)],
+                [str(per_chunk), str(per_chunk), str(count)],
+                ["0", str(per_chunk), str(count)],
+            ],
+        )
+        self.assertEqual(headers[0], headers[1])
+        self.assertNotEqual(headers[0][36:68], headers[2][36:68])
+        self.assertEqual(headers[0][:36] + headers[0][68:], headers[2][:36] + headers[2][68:])
+        self.assertEqual(core.methods.count("getblocktemplate"), 1)
+
+    def test_candidate_in_an_abandoned_version_chunk_is_saved_with_its_version(self) -> None:
+        core = FakeCore()
+        previous = core.template["previousblockhash"]
+        core.tips = [previous, previous, "ff" * 32]
+
+        def responder(fields):
+            if fields[1] in ("1", "3"):
+                return f"{fields[1]} NONE\n"
+            return self.rolled_only_responder(fields)
+
+        process = FakeCudaProcess(responder)
+        with (
+            patch("regtest_miner.rpc", side_effect=core),
+            patch("regtest_miner.subprocess.Popen", return_value=process),
+            patch("regtest_miner.save_unsubmitted_block", return_value=Path("saved.hex")) as save,
+            patch("regtest_miner.flush_saved_block"),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            miner = CudaMiner(Path("cuda_miner.exe"))
+            arguments = (
+                Path("bitcoin-cli.exe"), miner, "mainnet", None, None, 50, 0,
+                bytes.fromhex(PAYOUT_SCRIPT),
+            )
+            self.assertFalse(mine_one_block(*arguments, live_mainnet=True, version_rolling=True))
+            save.assert_not_called()
+            core.template = dict(core.template, curtime=core.template["curtime"] + 1)
+            self.assertTrue(
+                mine_one_block(
+                    *arguments, live_mainnet=True, payout_address=PAYOUT_ADDRESS,
+                    version_rolling=True,
+                )
+            )
+
+        (stale_hash, stale_block), (_fresh_hash, fresh_block) = (
+            call.args for call in save.call_args_list
+        )
+        stale_request = bytes.fromhex(process.requests[1].split()[2])
+        self.assertEqual(stale_block[4:76], stale_request[4:76])
+        self.assertNotEqual(stale_block[:4], stale_request[:4])
+        self.assertEqual(stale_hash, double_sha256(stale_block[:80])[::-1].hex())
+        self.assertLessEqual(int(stale_hash, 16), bits_to_target(0x207FFFFF))
+        self.assertEqual(core.submitted, [fresh_block.hex()])
+        self.assertIn(f"STALE CANDIDATE: block {stale_hash}", output.getvalue())
+
+    def test_main_passes_the_flag_to_the_scan(self) -> None:
+        core = FakeCore()
+        process = FakeCudaProcess(cpu_rolled_responder)
+        with (
+            patch("regtest_miner.parse_args", return_value=live_args(version_rolling=True)),
+            patch("regtest_miner.ensure_tor_ready", return_value=None),
+            patch("regtest_miner.rpc", side_effect=core),
+            patch("regtest_miner.subprocess.Popen", return_value=process),
+            patch("regtest_miner.save_unsubmitted_block", return_value=None),
+            patch("regtest_miner.monitor_block", return_value=0),
+            patch("regtest_miner.keep_system_awake"),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(main(), 0)
+        self.assertTrue(process.requests[0].startswith("SCANV "))
+        self.assertTrue(process.requests[0].endswith(f" {regtest_miner.VERSION_ROLL_COUNT}\n"))
+        self.assertEqual(len(core.submitted), 1)
 
 
 class StaleCandidatePreservationTests(unittest.TestCase):

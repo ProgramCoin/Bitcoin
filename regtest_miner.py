@@ -53,6 +53,12 @@ TIP_CONFIRMATION_SECONDS = 2.0
 # A template older than this is replaced at the next nonce-space rollover;
 # until then exhausted nonce space only rolls the coinbase extranonce.
 TEMPLATE_REFRESH_SECONDS = 30.0
+# BIP 320 reserves bits 13-28 of the block version for miners. With
+# --version-rolling the GPU hashes this many variants of each header per
+# nonce: variant i is the header with i added to that field.
+VERSION_ROLL_SHIFT = 13
+VERSION_ROLL_MASK = 0xFFFF << VERSION_ROLL_SHIFT
+VERSION_ROLL_COUNT = 16
 STATUS_INTERVAL = 5.0
 SUBMIT_TIMEOUT = 120.0
 # Waits before each further submitblock attempt after one failed without
@@ -750,6 +756,22 @@ def build_header(template: dict, coinbase_txid: bytes, transaction_txids: list[b
     )
 
 
+def candidate_header(header: bytes, nonce: int, variant: int = 0) -> bytes:
+    """The 80-byte header a scan result names: its nonce and version variant."""
+    version = struct.unpack("<I", header[:4])[0]
+    # A variant must fit the BIP 320 field, which the base header leaves clear.
+    if variant and (
+        version & VERSION_ROLL_MASK
+        or not 0 < variant <= VERSION_ROLL_MASK >> VERSION_ROLL_SHIFT
+    ):
+        raise RuntimeError("CUDA miner returned an impossible version variant")
+    return (
+        struct.pack("<I", version + (variant << VERSION_ROLL_SHIFT))
+        + header[4:76]
+        + struct.pack("<I", nonce)
+    )
+
+
 def serialize_block(
     header: bytes,
     coinbase: bytes,
@@ -1435,10 +1457,11 @@ class CudaMiner:
         self.failed = False
         self.request_id = 0
         self.pending_id: str | None = None
+        self.pending_versions = 1
         self.pending_abandoned = False
         # Result of the last abandoned chunk once it has been read, and the
         # block context needed to check it; see preserve_abandoned_candidate.
-        self.abandoned_result: tuple[int, str] | None = None
+        self.abandoned_result: tuple | None = None
         self.abandoned_work: tuple | None = None
 
     def _start(self) -> None:
@@ -1480,12 +1503,20 @@ class CudaMiner:
                 detail += f": {diagnostics.strip()}"
         raise RuntimeError(f"CUDA miner failed: {detail}")
 
-    def scan(self, header: bytes, start: int, count: int) -> tuple[int, str] | None:
-        self.start_scan(header, start, count)
+    def scan(
+        self, header: bytes, start: int, count: int, versions: int = 1
+    ) -> tuple | None:
+        self.start_scan(header, start, count, versions)
         return self.finish_scan()
 
-    def start_scan(self, header: bytes, start: int, count: int) -> None:
-        """Send one request and return at once; the GPU scans in the background."""
+    def start_scan(
+        self, header: bytes, start: int, count: int, versions: int = 1
+    ) -> None:
+        """Send one request and return at once; the GPU scans in the background.
+
+        With versions > 1 the range is scanned for that many version variants
+        of the header, and a hit is reported as (nonce, hash, variant).
+        """
         if self.failed:
             raise RuntimeError(
                 "CUDA miner failed earlier in this session and was not restarted"
@@ -1502,14 +1533,16 @@ class CudaMiner:
 
         self.request_id = (self.request_id + 1) & 0xFFFFFFFF
         request_id = str(self.request_id)
+        request = f"SCAN {request_id} {header.hex()} {start} {count}"
+        if versions > 1:
+            request = f"SCANV {request_id} {header.hex()} {start} {count} {versions}"
         try:
-            self.process.stdin.write(
-                f"SCAN {request_id} {header.hex()} {start} {count}\n"
-            )
+            self.process.stdin.write(request + "\n")
             self.process.stdin.flush()
         except (OSError, ValueError) as error:
             self._fail(f"lost contact with the CUDA process ({error})")
         self.pending_id = request_id
+        self.pending_versions = versions
         self.pending_abandoned = False
 
     def abandon_scan(self) -> None:
@@ -1517,14 +1550,14 @@ class CudaMiner:
         if self.pending_id is not None:
             self.pending_abandoned = True
 
-    def drain_abandoned(self) -> tuple[int, str] | None:
+    def drain_abandoned(self) -> tuple | None:
         """Read (once) what the abandoned chunk found; None if there was none."""
         if self.pending_id is not None and self.pending_abandoned and not self.failed:
             self.abandoned_result = self._read_reply()
         result, self.abandoned_result = self.abandoned_result, None
         return result
 
-    def finish_scan(self) -> tuple[int, str] | None:
+    def finish_scan(self) -> tuple | None:
         if self.failed:
             raise RuntimeError(
                 "CUDA miner failed earlier in this session and was not restarted"
@@ -1533,8 +1566,9 @@ class CudaMiner:
             self._fail("no scan result is waiting to be read")
         return self._read_reply()
 
-    def _read_reply(self) -> tuple[int, str] | None:
+    def _read_reply(self) -> tuple | None:
         expected_id = self.pending_id
+        versions = self.pending_versions
         self.pending_id = None
         self.pending_abandoned = False
         try:
@@ -1549,7 +1583,7 @@ class CudaMiner:
             if fields[1:] == ["NONE"]:
                 return None
             if (
-                len(fields) == 4
+                len(fields) == (4 if versions == 1 else 5)
                 and fields[1] == "FOUND"
                 and fields[2].isascii()
                 and fields[2].isdigit()
@@ -1557,7 +1591,15 @@ class CudaMiner:
                 and len(fields[3]) == 64
                 and all(character in "0123456789abcdef" for character in fields[3])
             ):
-                return int(fields[2]), fields[3]
+                if versions == 1:
+                    return int(fields[2]), fields[3]
+                # A version-rolling scan also names the variant that was hit.
+                if (
+                    fields[4].isascii()
+                    and fields[4].isdigit()
+                    and int(fields[4]) < versions
+                ):
+                    return int(fields[2]), fields[3], int(fields[4])
         self._fail(f"Unexpected CUDA miner output: {line!r}")
 
     def close(self) -> None:
@@ -1591,11 +1633,12 @@ def start_chunk(
     header: bytes,
     start: int,
     count: int,
+    versions: int = 1,
 ) -> None:
-    cuda_miner.start_scan(header, start, count)
+    cuda_miner.start_scan(header, start, count, versions)
 
 
-def finish_chunk(cuda_miner: CudaMiner) -> tuple[int, str] | None:
+def finish_chunk(cuda_miner: CudaMiner) -> tuple | None:
     return cuda_miner.finish_scan()
 
 
@@ -1613,8 +1656,18 @@ def find_nonce(
     stale_check: Callable[[], bool],
     pause_check: Callable[[], str | None] | None = None,
     overlap_first_check: bool = False,
-) -> tuple[int, bytes] | None:
+    version_count: int = 1,
+) -> tuple | None:
+    """Scan the nonce range; returns (nonce, hash) of a CPU-verified hit, or None.
+
+    With version_count > 1 every nonce is hashed for that many version
+    variants of the header and a hit is returned as (nonce, hash, variant).
+    """
     target = bits_to_target(bits)
+    rolled = (version_count,) if version_count > 1 else ()
+    # A chunk holds chunk_size hashes either way, so it takes as long and the
+    # tip is checked as often.
+    chunk_size = max(1, chunk_size // version_count)
     start = nonce_start
     count = 0
     total_hashes = 0
@@ -1628,7 +1681,7 @@ def find_nonce(
             # The caller has just seen this tip confirmed, so the first chunk
             # is treated like every later one: launched, then checked.
             chunk_started = time.perf_counter()
-            start_chunk(cuda_miner, header, start, count)
+            start_chunk(cuda_miner, header, start, count, *rolled)
             if stale_check():
                 abandon_chunk(cuda_miner)
                 raise StaleTemplate
@@ -1637,13 +1690,13 @@ def find_nonce(
             if stale_check():
                 raise StaleTemplate
             chunk_started = time.perf_counter()
-            start_chunk(cuda_miner, header, start, count)
+            start_chunk(cuda_miner, header, start, count, *rolled)
     while count:
         # The tip check belonging to this chunk has already returned "still
         # current"; only then is the chunk's result read.
         candidate = finish_chunk(cuda_miner)
         chunk_seconds = time.perf_counter() - chunk_started
-        total_hashes += count
+        total_hashes += count * version_count
         now = time.perf_counter()
         elapsed = max(now - scan_started, 1e-9)
         if candidate is not None or now - last_status >= STATUS_INTERVAL:
@@ -1651,24 +1704,25 @@ def find_nonce(
             print(
                 f"\rHashing nonce {start:08x}..{start + count - 1:08x} "
                 f"of {nonce_start:08x}..{nonce_end:08x} | "
-                f"{total_hashes:,} hashes | "
-                f"{count / max(chunk_seconds, 1e-9):,.0f} H/s chunk | "
+                f"{total_hashes:,} hashes"
+                f"{f' ({version_count} versions per nonce)' if rolled else ''} | "
+                f"{count * version_count / max(chunk_seconds, 1e-9):,.0f} H/s chunk | "
                 f"{total_hashes / elapsed:,.0f} H/s average",
                 end="",
                 flush=True,
             )
         if candidate is not None:
             print()
-            nonce, displayed_hash = candidate
+            nonce, displayed_hash, *variant = candidate
             if not start <= nonce < start + count:
                 raise RuntimeError("CUDA miner returned a nonce outside its assigned range")
-            nonce_header = header[:76] + struct.pack("<I", nonce)
+            nonce_header = candidate_header(header, nonce, *variant)
             actual_hash = double_sha256(nonce_header)
             if actual_hash[::-1].hex() != displayed_hash:
                 raise RuntimeError("CUDA hash does not match the CPU SHA-256d result")
             if int.from_bytes(actual_hash[::-1], "big") > target:
                 raise RuntimeError("CUDA returned a hash that does not meet the target")
-            return nonce, actual_hash
+            return (nonce, actual_hash, *variant)
 
         next_start = start + count
         if next_start > nonce_end:
@@ -1684,7 +1738,7 @@ def find_nonce(
         # the same moment as before; if it reports a new tip (or fails), the
         # chunk already running is abandoned and its result is never read.
         next_started = time.perf_counter()
-        start_chunk(cuda_miner, header, next_start, next_count)
+        start_chunk(cuda_miner, header, next_start, next_count, *rolled)
         if stale_check():
             abandon_chunk(cuda_miner)
             print()
@@ -1694,8 +1748,9 @@ def find_nonce(
     if total_hashes:
         print()
     # CUDA uses 0xffffffff as its no-result sentinel, so verify that nonce on
-    # the CPU when it is included in the template's permitted range.
-    if nonce_start <= 0xFFFFFFFF <= nonce_end:
+    # the CPU when it is included in the template's permitted range. A
+    # version-rolling scan reports that nonce like any other.
+    if not rolled and nonce_start <= 0xFFFFFFFF <= nonce_end:
         last_header = header[:76] + struct.pack("<I", 0xFFFFFFFF)
         last_hash = double_sha256(last_header)
         if int.from_bytes(last_hash[::-1], "big") <= target:
@@ -1831,8 +1886,8 @@ def preserve_abandoned_candidate(cuda_miner: object, network: str) -> None:
         header, target, template, expected_previous, coinbase, coinbase_txid,
         transactions, payout_script, witness_commitment,
     ) = context
-    nonce, displayed_hash = reply
-    mined_header = header[:76] + struct.pack("<I", nonce)
+    nonce, displayed_hash, *variant = reply
+    mined_header = candidate_header(header, nonce, *variant)
     digest = double_sha256(mined_header)
     block_hash = digest[::-1].hex()
     if block_hash != displayed_hash:
@@ -1872,6 +1927,7 @@ def mine_one_block(
     live_mainnet: bool = False,
     payout_address: str | None = None,
     session: MiningSession | None = None,
+    version_rolling: bool = False,
 ) -> bool:
     work = session.prefetcher.take() if session is not None else None
     if work is None:
@@ -1898,10 +1954,24 @@ def mine_one_block(
     # The abandoned chunk is still running; its result is read here, when new
     # GPU work would have had to wait for it anyway.
     preserve_abandoned_candidate(cuda_miner, network)
+    version_count = 1
+    if version_rolling:
+        # The variants occupy the low end of the BIP 320 field, which Core
+        # leaves clear; a template that already uses it is mined unrolled.
+        if template["version"] & VERSION_ROLL_MASK:
+            print(
+                f"Template version {template['version']:08x} already uses the "
+                "BIP 320 bits; version rolling is off for this template.",
+                flush=True,
+            )
+        else:
+            version_count = VERSION_ROLL_COUNT
     print(
         f"{'Dry-running' if dry_run else 'Mining'} {network} block "
         f"{template['height']} "
-        f"(bits={template['bits']}, chunk={chunk_size:,})",
+        f"(bits={template['bits']}, chunk={chunk_size:,}"
+        + (f", versions per nonce={version_count}" if version_count > 1 else "")
+        + ")",
         flush=True,
     )
     expected_previous = template["previousblockhash"]
@@ -1956,6 +2026,7 @@ def mine_one_block(
                 work.nonce_end,
                 *scan_checks,
                 **({"overlap_first_check": True} if overlap else {}),
+                **({"version_count": version_count} if version_count > 1 else {}),
             )
         except StaleTemplate:
             if isinstance(cuda_miner, CudaMiner) and cuda_miner.pending_abandoned:
@@ -1983,8 +2054,8 @@ def mine_one_block(
             return False
         roll = (roll + 1) & 0xFFFFFFFF
 
-    nonce, raw_hash = candidate
-    mined_header = header[:76] + struct.pack("<I", nonce)
+    nonce, raw_hash, *variant = candidate
+    mined_header = candidate_header(header, nonce, *variant)
     block = serialize_block(mined_header, coinbase, work.transaction_data)
     block_hash = double_sha256(mined_header)[::-1].hex()
     if block_hash != raw_hash[::-1].hex():
@@ -2009,7 +2080,8 @@ def mine_one_block(
         ) from error
     print(
         f"CANDIDATE FOUND: height={template['height']} nonce={nonce} "
-        f"hash={block_hash}",
+        f"hash={block_hash}"
+        + (f" version={mined_header[:4][::-1].hex()}" if variant else ""),
         flush=True,
     )
 
@@ -2392,6 +2464,15 @@ def parse_args() -> argparse.Namespace:
         default=250000000,
         help="Nonces per CUDA process invocation (default: 250000000)",
     )
+    parser.add_argument(
+        "--version-rolling",
+        action="store_true",
+        help=(
+            f"Hash {VERSION_ROLL_COUNT} block versions per nonce (BIP 320 "
+            "bits 13-28), which share part of the SHA-256 work; a block "
+            "found this way carries the rolled version"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2619,6 +2700,7 @@ def main() -> int:
                     live_mainnet=args.live_mainnet,
                     payout_address=args.payout_address,
                     session=session,
+                    **({"version_rolling": True} if args.version_rolling else {}),
                 )
             except (MiningPaused, RpcError) as pause:
                 # Regtest keeps failing fast; on mainnet no candidate is

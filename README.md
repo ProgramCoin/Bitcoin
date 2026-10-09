@@ -295,7 +295,10 @@ ready, and reuses that process, its CUDA context and its device buffers for
 every nonce chunk and every later template. Each chunk is one request line on
 the process's stdin (`SCAN <id> <80-byte-hex> <start> <count>`) and one reply
 line on its stdout (`<id> NONE` or `<id> FOUND <nonce> <hash>`); diagnostics
-go to stderr. New work replaces the old header without a restart.
+go to stderr. New work replaces the old header without a restart. With
+`--version-rolling` the request is `SCANV <id> <80-byte-hex> <start> <count>
+<versions>` and a hit is reported as `<id> FOUND <nonce> <hash> <variant>`
+(see "Version rolling" below).
 
 The 32-bit nonce space of one header lasts only a few seconds. When it is
 exhausted the validated template is kept and only the coinbase extranonce is
@@ -340,8 +343,79 @@ The hash reported for a candidate always comes from the complete, unshortened
 computation, and the runner re-hashes it on the CPU. Each shortcut can be
 turned off at build time (`-DMINER_RESUME_FIRST_HASH=0`,
 `-DMINER_EARLY_SECOND_HASH=0`), and `-DMINER_NONCES_PER_THREAD=<n>` changes
-how many nonces each GPU thread hashes per launch (default 1, which measured
-best).
+how many nonces each GPU thread hashes per launch (default 1) and
+`-DMINER_THREADS_PER_BLOCK=<n>` the threads per block (default 256).
+Interleaved runs of 128, 256 and 512 threads and of 1, 2 and 4 nonces per
+thread all landed within 0.6% of each other, 128 threads being the slowest,
+so the defaults were kept.
+
+The kernel is at the instruction floor for this formulation of SHA256d: about
+2,640 GPU instructions per hash (1,230 shifts and rotates, 665 three-input
+logic operations, 681 additions), 39 registers, no spills and no stack frame.
+The card executes them as fast as its clock allows, so the hashrate follows
+the clock, and what remains is to do less work per hash, which is what
+version rolling does.
+
+#### Version rolling (optional)
+
+`--version-rolling` makes the GPU hash 16 versions of every header for each
+nonce. BIP 320 reserves bits 13-28 of the block version for miners; variant
+`i` is the header with `i` added to that field, so the versions used are
+`20000000`, `20002000`, ... `2001e000` for Core's usual template version.
+The variants differ only in the first 64 header bytes, that is in the
+midstate. The second SHA-256 block (Merkle-root tail, time, bits, nonce) is
+the same for all of them, and so is its message schedule, which is therefore
+expanded once per nonce instead of once per hash. That removes about 390 of
+the 2,640 instructions for 15 of every 16 hashes.
+
+| Versions per nonce | Sustained MH/s | Hashes per MHz of GPU clock |
+| --- | --- | --- |
+| 1 (default) | 701 | baseline |
+| 2 | 758 | +8.8% |
+| 4 | 795 | +13.2% |
+| 8 | 808 | +15.7% |
+| 16 (`--version-rolling`) | 813 | +17.0% |
+
+Measured in one interleaved run at 86-87 C through `--serve`, six 20-second
+slots each. The right-hand column divides out the clock the driver happened
+to allow in each slot, which is what makes runs on this thermally limited
+card comparable; it repeats to about 0.2%.
+
+What changes and what does not:
+
+- It is off unless the flag is given. Without it the runner sends the same
+  `SCAN` requests as before, and the scan kernel they use compiles to
+  byte-identical machine code.
+- A block found this way carries the rolled version, which `CANDIDATE FOUND`
+  prints. Nothing else in the header differs from the unrolled one: same
+  previous block, Merkle root, time and bits. The coinbase, payout script,
+  witness commitment and transaction set are untouched.
+- The GPU names the variant it hit. The runner rebuilds that 80-byte header,
+  hashes it on the CPU and requires the same hash, at or below the target,
+  exactly as for an unrolled candidate; a wrong variant fails closed. Every
+  later check, the saved-block file and the submission rules are unchanged.
+- A chunk still holds `--chunk-size` hashes, so the chain tip is checked as
+  often. One header now lasts about 85 seconds instead of 6, so the
+  extranonce is rarely rolled and a template is replaced about every 85
+  seconds instead of every 30 to 36; it is still dropped at once when the
+  tip changes. An older template only means slightly older transactions.
+- A template whose version already uses bits 13-28 is mined unrolled, with a
+  message saying so. Bitcoin Core does not set them.
+- Unlike the plain scan, the version scan can report nonce `ffffffff` itself,
+  so that nonce needs no separate CPU check.
+
+Rolled versions are valid by consensus (a version of 4 or more is all that
+is required) and many mainnet blocks carry them. Bitcoin Core 27 confirmed
+it for this miner's own blocks: built from a live mainnet template with each
+rolled version and offered through `getblocktemplate` in `proposal` mode,
+which validates without storing or submitting, every one was accepted, while
+a block with version 1 was refused as `bad-version` and one with a wrong
+Merkle root as `bad-txnmrklroot`. Core's template does not list the version
+as mutable; that list is advice from a template server to its clients, not a
+consensus rule.
+
+To use it, add `--version-rolling` to the command line, or to the `python`
+line of the launcher.
 
 The host thread sleeps while a kernel runs (`cudaDeviceScheduleBlockingSync`)
 instead of spinning a CPU core. On the thermally limited laptop GPU this was
@@ -381,6 +455,7 @@ correct, verified miner, not its earnings.
 | --- | --- |
 | First seconds from idle | about 810-830 MH/s |
 | Sustained, GPU at 86-87 C | about 700-750 MH/s |
+| Sustained with `--version-rolling` | about 790-815 MH/s |
 | Effective rate as a share of the raw rate | about 99.9% |
 | GPU idle between work items | about 0.1% |
 | Gap at an extranonce rollover | under 1 ms |
@@ -453,8 +528,13 @@ Verified: payout construction against live mainnet templates, the complete
 submission path on regtest up to a full-weight block (including a lost reply,
 failed calls, and Bitcoin Core being stopped at submission time), pause and
 recovery with a real Tor interruption, block monitoring through a real
-reorganization to maturity, and clean shutdown on Ctrl+C.
+reorganization to maturity, and clean shutdown on Ctrl+C. For version
+rolling: every variant against the CPU over randomized headers, targets and
+ranges including the last nonce, acceptance of the rolled versions by Bitcoin Core in proposal
+mode, and a 200-second mainnet dry-run (no repeated or skipped nonce range,
+no `submitblock` call).
 
-Not verified: an actual mainnet block submission, unattended runs longer than
+Not verified: an actual mainnet block submission, a submitted block with a
+rolled version, unattended runs longer than
 about fifteen minutes, and loss of Bitcoin Core's own peers (the tests
 interrupted the Tor proxy, not the node's connections).
