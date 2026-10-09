@@ -367,7 +367,12 @@ any other before it could be submitted. A template older than 30 seconds is
 replaced at the next rollover. On mainnet its replacement is fetched and
 validated on a background thread while the GPU keeps scanning, and handed over
 as a finished, immutable work item; that thread never talks to the CUDA
-process.
+process. With `--version-rolling` a pass over one header takes longer than
+those 30 seconds, so the replacement is fetched only when the pass is
+predicted, from the nonces left and the rate measured during the pass, to end
+within about 8 seconds. If that fetch fails it is retried once 5 seconds
+later; if no replacement is ready when the pass ends, a template is fetched
+directly, as before.
 
 The chain-tip check runs once per chunk. The first chunk of a template is
 checked before it is sent, unless the same tip was confirmed within the last
@@ -457,7 +462,11 @@ What changes and what does not:
   often. One header now lasts about 85 seconds instead of 6, so the
   extranonce is rarely rolled and a template is replaced about every 85
   seconds instead of every 30 to 36; it is still dropped at once when the
-  tip changes. An older template only means slightly older transactions.
+  tip changes. Each replacement is fetched about 8 seconds before it takes
+  over, so a template is about 8 seconds old when hashing on it starts and
+  one pass older when it ends (measured: 8 s and 81 s at 72-second passes;
+  fetched at the 30-second mark it was 72 s and 145 s). An older template
+  only means slightly older transactions.
 - A template whose version already uses bits 13-28 is mined unrolled, with a
   message saying so. Bitcoin Core does not set them.
 - Unlike the plain scan, the version scan can report nonce `ffffffff` itself,
@@ -546,7 +555,8 @@ Hashing nonce 00000000..0ee6b27f of 00000000..ffffffff | 250,000,000 hashes | ..
 - `Mining mainnet block N` names the block being attempted, which is always
   Bitcoin Core's current tip plus one.
 - `Nonce space exhausted; switching to the refreshed template.` appears about
-  every 30 seconds with the same height: same block, updated transactions.
+  every 30 seconds with the same height (with `--version-rolling`, once per
+  pass, every 70 to 85 seconds): same block, updated transactions.
 - `Template became stale; requesting new work.` followed by a height one
   higher means the network found a block and work moved on to the next one.
 - A single `[MONITOR] Tip check failed (1/3)` is harmless. `Mining paused`

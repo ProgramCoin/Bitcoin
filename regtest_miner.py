@@ -53,6 +53,11 @@ TIP_CONFIRMATION_SECONDS = 2.0
 # A template older than this is replaced at the next nonce-space rollover;
 # until then exhausted nonce space only rolls the coinbase extranonce.
 TEMPLATE_REFRESH_SECONDS = 30.0
+# With --version-rolling one pass over the nonce space outlasts that age, so
+# the replacement is fetched only when the pass is predicted to end within
+# this many seconds; fetched any earlier it would wait out the pass and be
+# that much older when its turn came.
+PREFETCH_LEAD_SECONDS = 8.0
 # BIP 320 reserves bits 13-28 of the block version for miners. With
 # --version-rolling the GPU hashes this many variants of each header per
 # nonce: variant i is the header with i added to that field.
@@ -1442,6 +1447,8 @@ class TemplatePrefetcher:
         self.result: Work | None = None
         self.thread: threading.Thread | None = None
         self.next_request = 0.0
+        # Raised by discard, so that a fetch still running then is dropped too.
+        self.generation = 0
 
     def request(self) -> None:
         with self.lock:
@@ -1453,11 +1460,14 @@ class TemplatePrefetcher:
                 return
             self.next_request = time.monotonic() + self.RETRY_SECONDS
             self.thread = threading.Thread(
-                target=self._run, name="template-prefetch", daemon=True
+                target=self._run,
+                args=(self.generation,),
+                name="template-prefetch",
+                daemon=True,
             )
             self.thread.start()
 
-    def _run(self) -> None:
+    def _run(self, generation: int) -> None:
         try:
             work = self.fetch()
         except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError):
@@ -1465,7 +1475,8 @@ class TemplatePrefetcher:
             # out about a persistent failure through its own checks.
             return
         with self.lock:
-            self.result = work
+            if generation == self.generation:
+                self.result = work
 
     def ready(self) -> bool:
         with self.lock:
@@ -1477,7 +1488,9 @@ class TemplatePrefetcher:
             return work
 
     def discard(self) -> None:
-        self.take()
+        with self.lock:
+            self.generation += 1
+            self.result = None
 
     def close(self) -> None:
         if self.thread is not None:
@@ -1516,7 +1529,19 @@ class MiningSession:
             and time.monotonic() - self.confirmed_tip[1] <= TIP_CONFIRMATION_SECONDS
         )
 
-    def tip_changed(self, expected_previous: str, fetched_at: float) -> bool:
+    def tip_changed(
+        self,
+        expected_previous: str,
+        fetched_at: float,
+        pass_remaining: float | None = None,
+    ) -> bool:
+        """Ask Core for its tip; True means the template is stale.
+
+        pass_remaining is the predicted time in seconds until the nonce space
+        of the current header is exhausted. When it is given, the replacement
+        template is requested only within PREFETCH_LEAD_SECONDS of that
+        moment; without it the template's age alone decides.
+        """
         try:
             tip = rpc(
                 self.cli,
@@ -1542,7 +1567,9 @@ class MiningSession:
             self.confirmed_tip = None
             return True
         self.confirmed_tip = (tip, time.monotonic())
-        if time.monotonic() - fetched_at >= TEMPLATE_REFRESH_SECONDS:
+        if time.monotonic() - fetched_at >= TEMPLATE_REFRESH_SECONDS and (
+            pass_remaining is None or pass_remaining <= PREFETCH_LEAD_SECONDS
+        ):
             self.prefetcher.request()
         return False
 
@@ -1880,11 +1907,16 @@ def find_nonce(
     pause_check: Callable[[], str | None] | None = None,
     overlap_first_check: bool = False,
     version_count: int = 1,
+    report_remaining: Callable[[float], None] | None = None,
 ) -> tuple | None:
     """Scan the nonce range; returns (nonce, hash) of a CPU-verified hit, or None.
 
     With version_count > 1 every nonce is hashed for that many version
     variants of the header and a hit is returned as (nonce, hash, variant).
+
+    report_remaining, if given, is told before each tip check after the first
+    how many seconds the rest of the range is predicted to take, from the
+    rate measured over this call so far.
     """
     target = bits_to_target(bits)
     rolled = (version_count,) if version_count > 1 else ()
@@ -1962,6 +1994,10 @@ def find_nonce(
         # chunk already running is abandoned and its result is never read.
         next_started = time.perf_counter()
         start_chunk(cuda_miner, header, next_start, next_count, *rolled)
+        if report_remaining is not None:
+            report_remaining(
+                (nonce_end - next_start + 1) * elapsed / (next_start - nonce_start)
+            )
         if stale_check():
             abandon_chunk(cuda_miner)
             print()
@@ -2211,9 +2247,20 @@ def mine_one_block(
         )
     else:
         scan_checks = (
-            lambda: session.tip_changed(expected_previous, work.fetched_at),
+            lambda: session.tip_changed(
+                expected_previous, work.fetched_at, *pass_remaining
+            ),
             session.pause_reason,
         )
+    # A version-rolling pass is long enough for the replacement template to be
+    # fetched near its predicted end; find_nonce keeps the prediction here.
+    # An unrolled pass lasts seconds and leaves this empty, so the age of the
+    # template alone decides, as before.
+    pass_remaining: list[float] = []
+    timed_prefetch = session is not None and version_count > 1
+
+    def report_remaining(seconds: float) -> None:
+        pass_remaining[:] = [seconds]
 
     # Exhausting the 32-bit nonce space only needs a different coinbase, so
     # the validated template is kept and the extranonce rolled. The caller's
@@ -2239,6 +2286,9 @@ def mine_one_block(
         overlap = roll > 0 or (
             session is not None and session.tip_confirmed_recently(expected_previous)
         )
+        if timed_prefetch:
+            # Nothing is measured yet, so the end of this pass is not near.
+            pass_remaining[:] = [math.inf]
         try:
             candidate = find_nonce(
                 cuda_miner,
@@ -2250,6 +2300,7 @@ def mine_one_block(
                 *scan_checks,
                 **({"overlap_first_check": True} if overlap else {}),
                 **({"version_count": version_count} if version_count > 1 else {}),
+                **({"report_remaining": report_remaining} if timed_prefetch else {}),
             )
         except StaleTemplate:
             if isinstance(cuda_miner, CudaMiner) and cuda_miner.pending_abandoned:
@@ -2270,6 +2321,11 @@ def mine_one_block(
             print("Nonce space exhausted; switching to the refreshed template.")
             return False
         if age >= TEMPLATE_REFRESH_SECONDS * (1 if session is None else 2):
+            if session is not None:
+                # A prefetch that has not answered by now is replaced by the
+                # fetch that follows; its late result would be adopted a
+                # whole pass later, already old.
+                session.prefetcher.discard()
             print(
                 "Nonce space exhausted; changing the coinbase extranonce "
                 "and retrying the template."

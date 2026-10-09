@@ -3374,6 +3374,124 @@ class ExtranonceRollingTests(unittest.TestCase):
         self.assertIn("switching to the refreshed template", self.output.getvalue())
         self.assertIs(prefetcher.take(), prepared)
 
+    def timed_pass(self, fetch, **kwargs):
+        """One pass of 100 chunks on a clock that advances a second per chunk.
+
+        Returns the clock readings at which the prefetcher called fetch.
+        """
+        rolled = kwargs.get("version_rolling", False)
+        per_chunk = 50 // (regtest_miner.VERSION_ROLL_COUNT if rolled else 1)
+        template = dict(
+            self.small_range_template(), noncerange=f"00000000{100 * per_chunk - 1:08x}"
+        )
+        clock = [0.0]
+        fetched_at = []
+
+        def timed_fetch():
+            fetched_at.append(clock[0])
+            return fetch()
+
+        prefetcher = TemplatePrefetcher(timed_fetch)
+
+        def responder(fields):
+            # A fetch requested during the previous chunk has finished by now.
+            if prefetcher.thread is not None:
+                prefetcher.thread.join(5)
+            clock[0] += 1.0
+            return f"{fields[1]} NONE\n"
+
+        self.core = FakeCore(template)
+        self.process = FakeCudaProcess(responder)
+        with (
+            patch("regtest_miner.time.monotonic", lambda: clock[0]),
+            patch("regtest_miner.time.perf_counter", lambda: clock[0]),
+        ):
+            self.assertFalse(
+                self.run_block(
+                    self.core, self.process, session=self.session(prefetcher), **kwargs
+                )
+            )
+        self.assertEqual(len(self.process.requests), 100)
+        return fetched_at
+
+    def prepared_work(self):
+        with patch("regtest_miner.rpc", side_effect=FakeCore(self.small_range_template())):
+            return fetch_work(Path("bitcoin-cli.exe"), "mainnet", None, None)
+
+    def test_version_rolling_pass_prefetches_shortly_before_it_ends(self) -> None:
+        prepared = self.prepared_work()
+        fetched_at = self.timed_pass(lambda: prepared, version_rolling=True)
+
+        # The template passed the refresh age 70 chunks before the end, but
+        # its replacement is fetched once, within the lead time, so it is at
+        # most that old when the pass ends and it takes over.
+        self.assertEqual(len(fetched_at), 1)
+        lead = 100.0 - fetched_at[0]
+        self.assertGreaterEqual(lead, 5.0)
+        self.assertLessEqual(lead, regtest_miner.PREFETCH_LEAD_SECONDS)
+        self.assertIn("switching to the refreshed template", self.output.getvalue())
+        self.assertEqual(self.core.methods.count("getblocktemplate"), 1)
+
+    def test_unrolled_pass_still_prefetches_by_template_age(self) -> None:
+        prepared = self.prepared_work()
+        fetched_at = self.timed_pass(lambda: prepared)
+
+        self.assertEqual(fetched_at, [regtest_miner.TEMPLATE_REFRESH_SECONDS])
+        self.assertIn("switching to the refreshed template", self.output.getvalue())
+
+    def test_failed_timed_prefetch_is_retried_then_replaced_by_a_direct_fetch(self) -> None:
+        def failing():
+            raise RpcError("Bitcoin Core RPC getblocktemplate failed")
+
+        fetched_at = self.timed_pass(failing, version_rolling=True)
+
+        # One retry fits into the lead time; with nothing prepared the pass
+        # ends as it did before, and the caller fetches a template itself.
+        self.assertEqual(len(fetched_at), 2)
+        self.assertEqual(fetched_at[1] - fetched_at[0], TemplatePrefetcher.RETRY_SECONDS)
+        self.assertNotIn("switching to the refreshed template", self.output.getvalue())
+        self.assertIn("Nonce space exhausted", self.output.getvalue())
+
+    def test_prefetch_is_requested_only_near_the_predicted_end_of_a_pass(self) -> None:
+        tip = "00" * 32
+        prefetcher = MagicMock()
+        session = self.session(prefetcher)
+        lead = regtest_miner.PREFETCH_LEAD_SECONDS
+        with patch("regtest_miner.rpc", return_value=tip):
+            old = regtest_miner.time.monotonic() - 2 * regtest_miner.TEMPLATE_REFRESH_SECONDS
+            self.assertFalse(session.tip_changed(tip, old, lead + 1.0))
+            self.assertFalse(session.tip_changed(tip, old, float("inf")))
+            prefetcher.request.assert_not_called()
+            # A young template is never replaced, however close the end is.
+            self.assertFalse(session.tip_changed(tip, regtest_miner.time.monotonic(), 0.0))
+            prefetcher.request.assert_not_called()
+            self.assertFalse(session.tip_changed(tip, old, lead))
+            self.assertEqual(prefetcher.request.call_count, 1)
+            # Without a prediction the age alone decides.
+            self.assertFalse(session.tip_changed(tip, old))
+            self.assertEqual(prefetcher.request.call_count, 2)
+
+    def test_discard_also_drops_a_fetch_that_is_still_running(self) -> None:
+        prepared = self.prepared_work()
+        release = threading.Event()
+
+        def slow_fetch():
+            release.wait(5)
+            return prepared
+
+        prefetcher = TemplatePrefetcher(slow_fetch)
+        prefetcher.request()
+        prefetcher.discard()
+        release.set()
+        prefetcher.thread.join(5)
+        self.assertFalse(prefetcher.ready())
+
+        # The next request is served normally.
+        prefetcher.next_request = 0.0
+        prefetcher.request()
+        prefetcher.thread.join(5)
+        self.assertIs(prefetcher.take(), prepared)
+
     def test_prefetch_failure_is_contained_and_not_restarted_in_a_tight_loop(self) -> None:
         calls = []
 
