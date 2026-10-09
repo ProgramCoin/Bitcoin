@@ -20,7 +20,14 @@ from bitcoin import (
 )
 import regtest_miner
 from regtest_miner import (
+    CudaFailure,
     CudaMiner,
+    NodeNotReady,
+    RecoverableStop,
+    ThermalStop,
+    check_gpu_temperature,
+    cuda_self_test,
+    gpu_temperature,
     MiningPaused,
     MiningSession,
     NodeMonitor,
@@ -2324,7 +2331,12 @@ class OverlappedTipCheckTests(unittest.TestCase):
 
         tip_calls = [kwargs for method, kwargs in calls if method == "getbestblockhash"]
         scan_timeout = {"timeout": regtest_miner.TIP_CHECK_TIMEOUT}
-        self.assertEqual(tip_calls, [{}, scan_timeout, scan_timeout])
+        # The tip check inside the template fetch is bounded as well.
+        self.assertEqual(tip_calls, [scan_timeout, scan_timeout, scan_timeout])
+        self.assertEqual(
+            [kwargs for method, kwargs in calls if method == "getblocktemplate"],
+            [{"timeout": regtest_miner.TEMPLATE_FETCH_TIMEOUT}],
+        )
         self.assertEqual(
             [kwargs for method, kwargs in calls if method == "submitblock"],
             [{"timeout": regtest_miner.SUBMIT_TIMEOUT}],
@@ -4132,6 +4144,627 @@ class SubmittedBlockStatusTests(unittest.TestCase):
             )
 
         self.assertEqual(status, "SUBMITTED")
+
+class AutoRestartTests(unittest.TestCase):
+    """--auto-restart: which failures start a new session, and what a restart repeats.
+
+    mine_one_block is scripted, so each test states exactly how a session ends.
+    """
+
+    def run_main(self, outcomes, core=None, extra=(), **overrides):
+        self.core = core if core is not None else FakeCore()
+        self.sleeps: list[float] = []
+        self.order: list[str] = []
+        self.output, self.errors = io.StringIO(), io.StringIO()
+        if callable(outcomes):
+            self.mine = MagicMock(side_effect=outcomes)
+        else:
+            # Each entry is how one session ends: a return value, an
+            # exception to raise, or a function to call.
+            script = iter(outcomes)
+
+            def next_outcome(*call_args, **call_kwargs):
+                outcome = next(script)
+                if callable(outcome) and not isinstance(outcome, type):
+                    return outcome(*call_args, **call_kwargs)
+                if isinstance(outcome, BaseException) or (
+                    isinstance(outcome, type) and issubclass(outcome, BaseException)
+                ):
+                    raise outcome
+                return outcome
+
+            self.mine = MagicMock(side_effect=next_outcome)
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            self.order.append("sleep")
+
+        arguments = live_args(**{"auto_restart": True, **overrides})
+        with (
+            patch("regtest_miner.parse_args", return_value=arguments),
+            patch("regtest_miner.ensure_tor_ready", return_value=None),
+            patch("regtest_miner.rpc", side_effect=self.core),
+            patch("regtest_miner.mine_one_block", self.mine),
+            patch("regtest_miner.cuda_self_test") as self.self_test,
+            patch(
+                "regtest_miner.acquire_single_instance",
+                side_effect=lambda: self.order.append("acquire") or 1234,
+            ) as self.acquire,
+            patch(
+                "regtest_miner.release_single_instance",
+                side_effect=lambda handle: self.order.append("release"),
+            ) as self.release,
+            patch("regtest_miner.time.sleep", side_effect=sleep),
+            patch("regtest_miner.keep_system_awake"),
+            patch("regtest_miner.subprocess.Popen") as self.popen,
+            patch("regtest_miner.monitor_block", return_value=0),
+            redirect_stdout(self.output),
+            redirect_stderr(self.errors),
+        ):
+            for name, replacement in extra:
+                context = patch(name, replacement)
+                context.start()
+                self.addCleanup(context.stop)
+            return main()
+
+    def sessions(self) -> int:
+        """Complete startups: each one validated the payout and asked the wallet."""
+        self.assertEqual(
+            self.core.methods.count("validateaddress"), self.core.methods.count("getaddressinfo")
+        )
+        return self.core.methods.count("validateaddress")
+
+    def test_cuda_failure_restarts_with_every_startup_check(self) -> None:
+        result = self.run_main([CudaFailure("CUDA miner failed: lost contact"), True])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(self.mine.call_count, 2)
+        self.assertEqual(self.sessions(), 2)
+        self.assertEqual(self.core.methods.count("getblockchaininfo"), 2)
+        self.assertEqual(self.core.methods.count("getnetworkinfo"), 2)
+        # The GPU is checked against the CPU before each session mines.
+        self.assertEqual(self.self_test.call_count, 2)
+        self.assertEqual(self.sleeps, [30.0])
+        text = self.output.getvalue()
+        self.assertIn("[SUPERVISOR] Session ended: CUDA miner failed: lost contact", text)
+        self.assertIn("Restart 1 of 10 in 30 s", text)
+        # Both sessions printed the complete live preflight summary.
+        self.assertEqual(text.count("LIVE MAINNET PREFLIGHT: PASS"), 2)
+        self.assertEqual(text.count("WALLET OWNERSHIP: PASS"), 2)
+
+    def test_connectivity_that_does_not_recover_in_time_restarts(self) -> None:
+        waits = MagicMock(side_effect=[NodeNotReady("Connectivity did not recover"), None])
+        result = self.run_main(
+            [MiningPaused("2 consecutive health checks failed"), True],
+            extra=[("regtest_miner.wait_for_recovery", waits)],
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(self.sessions(), 2)
+        self.assertEqual(self.sleeps, [30.0])
+        self.assertIn("Connectivity did not recover", self.output.getvalue())
+
+    def test_final_failures_are_never_restarted(self) -> None:
+        for error in (
+            RuntimeError("Invalid block template: missing bits"),
+            RuntimeError("CUDA hash does not match the CPU SHA-256d result"),
+            RuntimeError("CUDA returned a hash that does not meet the target"),
+            RuntimeError("Bitcoin Core rejected the block: high-hash"),
+            RuntimeError("submitblock failed for candidate 00ab: timed out"),
+            RuntimeError("Candidate block failed local consistency checks and was not submitted"),
+            RuntimeError("CUDA miner failed: Unexpected CUDA miner output: 'x'"),
+            ThermalStop("GPU temperature 95 C is at or above --max-gpu-temp 91 C"),
+            ValueError("unexpected"),
+            OSError("bitcoin-cli vanished"),
+        ):
+            with self.subTest(error=str(error)[:40]):
+                self.assertEqual(self.run_main([error, True]), 1)
+                self.assertEqual(self.mine.call_count, 1)
+                self.assertEqual(self.sessions(), 1)
+                self.assertEqual(self.sleeps, [])
+                self.assertIn(str(error), self.errors.getvalue())
+                self.assertIn("never restarted automatically", self.errors.getvalue())
+                self.assertNotIn("[SUPERVISOR] Restart", self.output.getvalue())
+
+    def test_accepted_block_ends_the_supervisor(self) -> None:
+        self.assertEqual(self.run_main([True, True]), 0)
+        self.assertEqual(self.mine.call_count, 1)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("Mining stopped after the accepted mainnet block", self.output.getvalue())
+
+    def test_payout_mismatch_at_a_restart_stops_before_any_mining(self) -> None:
+        core = FakeCore()
+
+        def fail_and_change_the_script(*_args, **_kwargs):
+            core.address_info = {"isvalid": True, "scriptPubKey": "0014" + "22" * 20}
+            raise CudaFailure("CUDA miner failed: gone")
+
+        self.assertEqual(self.run_main([fail_and_change_the_script, True], core=core), 1)
+        self.assertEqual(self.mine.call_count, 1)
+        self.assertEqual(self.sleeps, [30.0])
+        self.assertIn("Payout script mismatch", self.errors.getvalue())
+        self.assertEqual(self.self_test.call_count, 1)
+
+    def test_wallet_ownership_failure_at_a_restart_stops_before_any_mining(self) -> None:
+        core = FakeCore()
+
+        def fail_and_lose_ownership(*_args, **_kwargs):
+            core.wallet_info = dict(core.wallet_info, ismine=False)
+            raise CudaFailure("CUDA miner failed: gone")
+
+        self.assertEqual(self.run_main([fail_and_lose_ownership, True], core=core), 1)
+        self.assertEqual(self.mine.call_count, 1)
+        self.assertIn("Wallet ownership check failed", self.errors.getvalue())
+        self.assertNotIn("[SUPERVISOR] Restart 2", self.output.getvalue())
+
+    def test_first_start_must_pass_its_checks_without_help(self) -> None:
+        core = FakeCore()
+        core.chain_info["headers"] = 101
+        self.assertEqual(self.run_main([True], core=core), 1)
+        self.mine.assert_not_called()
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("not synchronized", self.errors.getvalue())
+        self.assertIn("nothing to restart", self.errors.getvalue())
+
+    def test_node_not_ready_at_a_restart_backs_off_and_tries_again(self) -> None:
+        core = FakeCore()
+
+        def fail_and_fall_behind(*_args, **_kwargs):
+            core.chain_info["headers"] = 101
+            raise CudaFailure("CUDA miner failed: gone")
+
+        outcomes = [fail_and_fall_behind, True]
+        real_sleeps = []
+
+        def catching_up(seconds):
+            real_sleeps.append(seconds)
+            if len(real_sleeps) == 2:
+                core.chain_info["headers"] = 100
+
+        self.assertEqual(
+            self.run_main(outcomes, core=core, extra=[("regtest_miner.time.sleep", catching_up)]), 0
+        )
+        self.assertEqual(real_sleeps, [30.0, 60.0])
+        self.assertEqual(self.mine.call_count, 2)
+        # The attempt that found Core behind never reached the payout checks.
+        self.assertEqual(self.sessions(), 2)
+        self.assertIn("Restart 2 of 10 in 60 s", self.output.getvalue())
+
+    def test_restarts_are_bounded_with_growing_delays(self) -> None:
+        def always_fails(*_args, **_kwargs):
+            raise CudaFailure("CUDA miner failed: CUDA scan error: unspecified launch failure")
+
+        self.assertEqual(self.run_main(always_fails), 1)
+        self.assertEqual(self.mine.call_count, 11)
+        self.assertEqual(
+            self.sleeps, [30.0, 60.0, 120.0, 300.0, 600.0, 600.0, 600.0, 600.0, 600.0, 600.0]
+        )
+        self.assertEqual(max(self.sleeps), 600.0)
+        self.assertIn("10 restarts in a row", self.errors.getvalue())
+        self.assertIn("unstable GPU or driver", self.errors.getvalue())
+
+    def test_only_healthy_mining_resets_the_restart_count(self) -> None:
+        failures = [CudaFailure("CUDA miner failed: gone")] * 12 + [KeyboardInterrupt]
+        with patch("regtest_miner.RESTART_HEALTHY_SECONDS", 0.0):
+            self.assertEqual(self.run_main(failures), 130)
+        # Every session counted as healthy, so each restart was the first again.
+        self.assertEqual(self.sleeps, [30.0] * 12)
+
+        # With the real threshold a session that fails at once is not healthy.
+        self.assertEqual(self.run_main([CudaFailure("x")] * 3 + [KeyboardInterrupt]), 130)
+        self.assertEqual(self.sleeps, [30.0, 60.0, 120.0])
+        progress = regtest_miner.SessionProgress()
+        self.assertEqual(progress.healthy_seconds(), 0.0)
+
+    def test_ctrl_c_during_backoff_stops_at_once(self) -> None:
+        def interrupted(_seconds):
+            raise KeyboardInterrupt
+
+        result = self.run_main(
+            [CudaFailure("CUDA miner failed: gone"), True],
+            extra=[("regtest_miner.time.sleep", interrupted)],
+        )
+        self.assertEqual(result, 130)
+        self.assertEqual(self.mine.call_count, 1)
+        self.assertIn("Stopped by user.", self.output.getvalue())
+        self.release.assert_called_once_with(1234)
+
+    def test_ctrl_c_while_mining_is_never_restarted(self) -> None:
+        self.assertEqual(self.run_main([KeyboardInterrupt, True]), 130)
+        self.assertEqual(self.mine.call_count, 1)
+        self.assertEqual(self.sleeps, [])
+        self.assertNotIn("[SUPERVISOR]", self.output.getvalue())
+
+    def test_mutex_is_held_from_before_the_first_check_through_backoff(self) -> None:
+        self.assertEqual(self.run_main([CudaFailure("CUDA miner failed: gone"), True]), 0)
+        self.assertEqual(self.order, ["acquire", "sleep", "release"])
+        self.acquire.assert_called_once()
+        self.release.assert_called_once_with(1234)
+
+    def test_second_instance_is_refused_before_any_rpc(self) -> None:
+        result = self.run_main(
+            [True], extra=[("regtest_miner.acquire_single_instance", lambda: None)]
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(self.core.methods, [])
+        self.mine.assert_not_called()
+        self.assertIn("already running", self.errors.getvalue())
+
+    @unittest.skipUnless(regtest_miner.sys.platform == "win32", "Windows named mutex")
+    def test_real_mutex_admits_one_holder(self) -> None:
+        name = "Local\\BitcoinCudaSoloMinerTest-%d" % random.getrandbits(48)
+        with patch("regtest_miner.SINGLE_INSTANCE_MUTEX", name):
+            first = regtest_miner.acquire_single_instance()
+            self.assertIsNotNone(first)
+            self.assertIsNone(regtest_miner.acquire_single_instance())
+            regtest_miner.release_single_instance(first)
+            second = regtest_miner.acquire_single_instance()
+            self.assertIsNotNone(second)
+            regtest_miner.release_single_instance(second)
+
+    def test_without_the_flag_nothing_is_supervised(self) -> None:
+        result = self.run_main([CudaFailure("CUDA miner failed: gone"), True], auto_restart=False)
+        self.assertEqual(result, 1)
+        self.assertEqual(self.mine.call_count, 1)
+        self.assertEqual(self.sleeps, [])
+        self.acquire.assert_not_called()
+        self.self_test.assert_not_called()
+        self.assertIn("Mainnet miner stopped: CUDA miner failed: gone", self.errors.getvalue())
+
+    def test_flags_are_off_by_default_and_mainnet_only(self) -> None:
+        with patch("sys.argv", ["regtest_miner.py"]):
+            args = parse_args()
+        self.assertFalse(args.auto_restart)
+        self.assertEqual(args.max_gpu_temp, 0)
+        with patch("sys.argv", ["regtest_miner.py", "--auto-restart", "--max-gpu-temp", "91"]):
+            args = parse_args()
+        self.assertTrue(args.auto_restart)
+        self.assertEqual(args.max_gpu_temp, 91)
+
+        for overrides in (
+            dict(network="regtest", payout_address=None, auto_restart=True),
+            dict(network="regtest", payout_address=None, max_gpu_temp=91),
+            dict(max_gpu_temp=30),
+            dict(max_gpu_temp=200),
+        ):
+            with self.subTest(overrides=overrides):
+                errors = io.StringIO()
+                with (
+                    patch("regtest_miner.parse_args", return_value=live_args(**overrides)),
+                    patch("regtest_miner.rpc") as rpc_mock,
+                    redirect_stderr(errors),
+                ):
+                    self.assertEqual(main(), 2)
+                rpc_mock.assert_not_called()
+
+
+class SupervisedSubmissionTests(unittest.TestCase):
+    """The real candidate path under --auto-restart: a submission is never repeated by a restart."""
+
+    def run_main(self, core, responder=None):
+        self.core = core
+        self.output, self.errors = io.StringIO(), io.StringIO()
+        process = FakeCudaProcess(responder or cpu_rolled_responder)
+        with (
+            patch(
+                "regtest_miner.parse_args",
+                return_value=live_args(auto_restart=True, version_rolling=True),
+            ),
+            patch("regtest_miner.ensure_tor_ready", return_value=None),
+            patch("regtest_miner.rpc", side_effect=core),
+            patch("regtest_miner.subprocess.Popen", return_value=process),
+            patch("regtest_miner.cuda_self_test"),
+            patch("regtest_miner.acquire_single_instance", return_value=1234),
+            patch("regtest_miner.release_single_instance"),
+            patch("regtest_miner.save_unsubmitted_block", return_value=None),
+            patch("regtest_miner.monitor_block", return_value=0) as self.monitor_block,
+            patch("regtest_miner.keep_system_awake"),
+            patch("regtest_miner.time.sleep"),
+            redirect_stdout(self.output),
+            redirect_stderr(self.errors),
+        ):
+            return main()
+
+    def assert_one_session(self) -> None:
+        self.assertEqual(self.core.methods.count("getblocktemplate"), 1)
+        self.assertEqual(self.core.methods.count("validateaddress"), 1)
+        self.assertNotIn("[SUPERVISOR] Restart", self.output.getvalue())
+
+    def test_unresolved_submission_is_final(self) -> None:
+        core = FakeCore()
+        core.submit_error = RpcError("Bitcoin Core RPC submitblock timed out after 120 seconds")
+        self.assertEqual(self.run_main(core), 1)
+
+        self.assert_one_session()
+        # Only the existing in-session schedule resubmitted, always the same
+        # block, and only after Core said it did not know it.
+        self.assertEqual(len(core.submitted), 1 + len(regtest_miner.SUBMIT_RETRY_DELAYS))
+        self.assertEqual(len(set(core.submitted)), 1)
+        self.assertIn("submitblock failed for candidate", self.errors.getvalue())
+        self.assertIn("never restarted automatically", self.errors.getvalue())
+
+    def test_rejected_block_is_final(self) -> None:
+        core = FakeCore()
+        core.submit_result = "high-hash"
+        self.assertEqual(self.run_main(core), 1)
+        self.assert_one_session()
+        self.assertEqual(len(core.submitted), 1)
+        self.assertIn("Bitcoin Core rejected the block: high-hash", self.errors.getvalue())
+
+    def test_accepted_block_is_monitored_not_restarted(self) -> None:
+        core = FakeCore()
+        core.header_confirmations = 1
+        self.assertEqual(self.run_main(core), 0)
+        self.assert_one_session()
+        self.assertEqual(len(core.submitted), 1)
+        self.monitor_block.assert_called_once()
+        self.assertIn("MAINNET BLOCK ACCEPTED", self.output.getvalue())
+
+    def test_gpu_hash_the_cpu_does_not_confirm_is_final(self) -> None:
+        def wrong_hash(fields):
+            reply = cpu_rolled_responder(fields).split()
+            return " ".join(reply[:3] + ["00" * 32] + reply[4:]) + "\n"
+
+        core = FakeCore()
+        self.assertEqual(self.run_main(core, wrong_hash), 1)
+        self.assert_one_session()
+        self.assertEqual(core.submitted, [])
+        self.assertIn("does not match the CPU", self.errors.getvalue())
+
+
+class CudaSelfTestTests(unittest.TestCase):
+    def miner(self, responder):
+        process = FakeCudaProcess(responder)
+        context = patch("regtest_miner.subprocess.Popen", return_value=process)
+        context.start()
+        self.addCleanup(context.stop)
+        return CudaMiner(Path("cuda_miner.exe")), process
+
+    def test_passes_when_every_scan_matches_the_cpu(self) -> None:
+        for versions in (1, 16):
+            with self.subTest(versions=versions):
+                miner, process = self.miner(cpu_rolled_responder)
+                with redirect_stdout(io.StringIO()) as output:
+                    cuda_self_test(miner, versions)
+                self.assertEqual(len(process.requests), 21)
+                command = "SCAN" if versions == 1 else "SCANV"
+                self.assertTrue(all(r.startswith(command + " ") for r in process.requests))
+                replies = [cpu_rolled_responder(r.split()) for r in process.requests]
+                # The vectors exercise hits and misses, and with rolling every variant.
+                self.assertTrue(any(" NONE" in reply for reply in replies))
+                if versions > 1:
+                    variants = {int(reply.split()[4]) for reply in replies if "FOUND" in reply}
+                    self.assertEqual(variants, set(range(16)))
+                    self.assertIn(f"{0xFFFFF800} 2048 16", process.requests[2])
+                self.assertIn("Self-test passed: 21 scans", output.getvalue())
+
+    def test_any_disagreement_with_the_cpu_is_a_final_error(self) -> None:
+        def misses_everything(fields):
+            return f"{fields[1]} NONE\n"
+
+        def wrong_variant(fields):
+            reply = cpu_rolled_responder(fields).split()
+            if len(reply) == 5:
+                reply[4] = str((int(reply[4]) + 1) % 16)
+            return " ".join(reply) + "\n"
+
+        def false_hit(fields):
+            reply = cpu_rolled_responder(fields)
+            return f"{fields[1]} FOUND {fields[3]} {'00' * 32} 0\n" if "NONE" in reply else reply
+
+        for responder in (misses_everything, wrong_variant, false_hit):
+            with self.subTest(responder=responder.__name__):
+                miner, _process = self.miner(responder)
+                with self.assertRaisesRegex(RuntimeError, "CUDA self-test failed") as caught:
+                    cuda_self_test(miner, 16)
+                self.assertNotIsInstance(caught.exception, RecoverableStop)
+
+    def test_failed_self_test_prevents_mining_and_is_not_restarted(self) -> None:
+        core = FakeCore()
+        process = FakeCudaProcess(lambda fields: f"{fields[1]} NONE\n")
+        errors = io.StringIO()
+        with (
+            patch(
+                "regtest_miner.parse_args",
+                return_value=live_args(auto_restart=True, version_rolling=True),
+            ),
+            patch("regtest_miner.ensure_tor_ready", return_value=None),
+            patch("regtest_miner.rpc", side_effect=core),
+            patch("regtest_miner.subprocess.Popen", return_value=process),
+            patch("regtest_miner.acquire_single_instance", return_value=1234),
+            patch("regtest_miner.release_single_instance"),
+            patch("regtest_miner.keep_system_awake"),
+            patch("regtest_miner.time.sleep") as sleep,
+            patch("regtest_miner.mine_one_block") as mine,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(errors),
+        ):
+            self.assertEqual(main(), 1)
+        mine.assert_not_called()
+        sleep.assert_not_called()
+        self.assertNotIn("getblocktemplate", core.methods)
+        self.assertIn("CUDA self-test failed", errors.getvalue())
+        self.assertIn("never restarted automatically", errors.getvalue())
+
+    def test_dead_process_is_a_cuda_failure_and_a_broken_reply_is_not(self) -> None:
+        miner, _process = self.miner(lambda fields: "")
+        with self.assertRaises(CudaFailure):
+            miner.scan(bytes(80), 0, 1)
+        with self.assertRaises(CudaFailure):
+            miner.scan(bytes(80), 0, 1)
+
+        miner, _process = self.miner(lambda fields: f"{fields[1]} MAYBE\n")
+        with self.assertRaisesRegex(RuntimeError, "Unexpected CUDA miner output") as caught:
+            miner.scan(bytes(80), 0, 1)
+        self.assertNotIsInstance(caught.exception, RecoverableStop)
+
+    @unittest.skipUnless(CUDA_MINER.is_file(), "Build cuda_miner.exe to run this vector")
+    def test_real_gpu_passes_the_self_test(self) -> None:
+        for versions in (16, 1):
+            with self.subTest(versions=versions):
+                miner = CudaMiner(CUDA_MINER)
+                self.addCleanup(miner.close)
+                with redirect_stdout(io.StringIO()) as output:
+                    cuda_self_test(miner, versions)
+                self.assertIn("Self-test passed", output.getvalue())
+                miner.close()
+
+
+class ContinuousHealthTests(unittest.TestCase):
+    def check(self, core) -> None:
+        with (
+            patch("regtest_miner.rpc", side_effect=core),
+            patch("regtest_miner.socks5_ready", return_value=True),
+        ):
+            check_node_health(Path("bitcoin-cli.exe"), None, None, "127.0.0.1", 9150, 1, False)
+
+    def test_core_behind_its_headers_is_unhealthy_while_mining(self) -> None:
+        core = FakeCore()
+        self.check(core)
+        core.chain_info["headers"] = 103
+        with self.assertRaisesRegex(RuntimeError, r"behind its header tip \(blocks=100, headers=103\)"):
+            self.check(core)
+        core.chain_info["headers"] = 100
+        core.chain_info["initialblockdownload"] = True
+        with self.assertRaisesRegex(RuntimeError, "initial block download"):
+            self.check(core)
+
+    def test_equal_heights_with_an_old_tip_are_not_taken_for_synchronized(self) -> None:
+        core = FakeCore()
+        now = 1_800_000_000
+        with patch("regtest_miner.time.time", return_value=now):
+            core.chain_info["time"] = now - 2 * 3600
+            self.check(core)
+            core.chain_info["time"] = now - 4 * 3600
+            with self.assertRaisesRegex(RuntimeError, "best block is 4.0 hours old"):
+                self.check(core)
+            # The startup preflight applies the same rule, as a readiness failure.
+            with (
+                patch("regtest_miner.rpc", side_effect=core),
+                patch("regtest_miner.ensure_tor_ready", return_value=None),
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(NodeNotReady, "hours old"),
+            ):
+                preflight_mainnet(
+                    Path("bitcoin-cli.exe"), None, None, "127.0.0.1", 9150, None, 1.0, 0.01, False
+                )
+
+    def test_template_fetch_calls_are_bounded(self) -> None:
+        core = FakeCore()
+        calls = []
+
+        def recording(cli, network, datadir, conf, method, *params, **kwargs):
+            calls.append((method, kwargs.get("timeout")))
+            return core(cli, network, datadir, conf, method, *params, **kwargs)
+
+        with patch("regtest_miner.rpc", side_effect=recording):
+            self.assertIsNotNone(fetch_work(Path("bitcoin-cli.exe"), "mainnet", None, None))
+        self.assertEqual(
+            calls,
+            [
+                ("getblocktemplate", regtest_miner.TEMPLATE_FETCH_TIMEOUT),
+                ("getbestblockhash", regtest_miner.TIP_CHECK_TIMEOUT),
+            ],
+        )
+        self.assertTrue(0 < regtest_miner.TEMPLATE_FETCH_TIMEOUT < 900)
+
+    def test_hung_template_fetch_becomes_a_pause_not_a_hang(self) -> None:
+        def hung(cli, network, datadir, conf, method, *params, **kwargs):
+            raise RpcError(f"Bitcoin Core RPC {method} timed out after 60 seconds")
+
+        with patch("regtest_miner.rpc", side_effect=hung):
+            with self.assertRaises(RpcError):
+                fetch_work(Path("bitcoin-cli.exe"), "mainnet", None, None)
+
+
+class ThermalStopTests(unittest.TestCase):
+    def test_temperature_is_read_from_nvidia_smi_and_unreadable_is_none(self) -> None:
+        done = MagicMock(stdout="87\n")
+        with patch("regtest_miner.subprocess.run", return_value=done) as run:
+            self.assertEqual(gpu_temperature(), 87)
+        self.assertEqual(run.call_args.args[0][0], "nvidia-smi")
+        self.assertIsNotNone(run.call_args.kwargs["timeout"])
+        for failure in (OSError("missing"), subprocess.TimeoutExpired("nvidia-smi", 10)):
+            with patch("regtest_miner.subprocess.run", side_effect=failure):
+                self.assertIsNone(gpu_temperature())
+        with patch("regtest_miner.subprocess.run", return_value=MagicMock(stdout="[N/A]\n")):
+            self.assertIsNone(gpu_temperature())
+
+    def test_limit_applies_at_or_above_and_never_when_unreadable(self) -> None:
+        with patch("regtest_miner.gpu_temperature", return_value=90):
+            check_gpu_temperature(91)
+        with patch("regtest_miner.gpu_temperature", return_value=None):
+            check_gpu_temperature(91)
+        with patch("regtest_miner.gpu_temperature", return_value=91):
+            with self.assertRaisesRegex(ThermalStop, "91 C is at or above --max-gpu-temp 91 C"):
+                check_gpu_temperature(91)
+
+    def test_two_hot_polls_in_a_row_stop_mining_for_good(self) -> None:
+        readings = iter([95, 80, 95, 95])
+
+        def thermal_check() -> None:
+            with patch("regtest_miner.gpu_temperature", return_value=next(readings)):
+                check_gpu_temperature(91)
+
+        monitor = NodeMonitor(lambda: None, 60.0, thermal_check)
+        session = MiningSession(
+            Path("bitcoin-cli.exe"), None, None, monitor, TemplatePrefetcher(lambda: None)
+        )
+        for _ in range(3):
+            monitor.poll()
+            self.assertIsNone(monitor.fatal)
+            self.assertIsNone(session.pause_reason())
+        monitor.poll()
+        self.assertIn("95 C", monitor.fatal)
+        # Not a pause: the mining thread stops with an error nothing restarts.
+        with self.assertRaises(ThermalStop) as caught:
+            session.pause_reason()
+        self.assertNotIsInstance(caught.exception, RecoverableStop)
+        # A hot GPU is not a connectivity failure.
+        self.assertIsNone(monitor.reason())
+
+    def run_main(self, temperature):
+        core = FakeCore()
+        errors = io.StringIO()
+        with (
+            patch(
+                "regtest_miner.parse_args",
+                return_value=live_args(auto_restart=True, max_gpu_temp=91),
+            ),
+            patch("regtest_miner.ensure_tor_ready", return_value=None),
+            patch("regtest_miner.rpc", side_effect=core),
+            patch("regtest_miner.gpu_temperature", return_value=temperature),
+            patch("regtest_miner.cuda_self_test") as self_test,
+            patch("regtest_miner.acquire_single_instance", return_value=1234),
+            patch("regtest_miner.release_single_instance"),
+            patch("regtest_miner.keep_system_awake"),
+            patch("regtest_miner.time.sleep") as sleep,
+            patch("regtest_miner.mine_one_block", return_value=True) as mine,
+            patch("regtest_miner.subprocess.Popen"),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(errors),
+        ):
+            result = main()
+        return result, mine, sleep, self_test, errors.getvalue()
+
+    def test_gpu_already_too_hot_or_unreadable_prevents_the_session(self) -> None:
+        result, mine, sleep, self_test, errors = self.run_main(95)
+        self.assertEqual(result, 1)
+        mine.assert_not_called()
+        sleep.assert_not_called()
+        self_test.assert_not_called()
+        self.assertIn("at or above --max-gpu-temp 91 C", errors)
+
+        result, mine, sleep, _self_test, errors = self.run_main(None)
+        self.assertEqual(result, 1)
+        mine.assert_not_called()
+        self.assertIn("did not report the GPU temperature", errors)
+
+        result, mine, _sleep, self_test, _errors = self.run_main(86)
+        self.assertEqual(result, 0)
+        mine.assert_called_once()
+        self_test.assert_called_once()
+
 
 
 if __name__ == "__main__":

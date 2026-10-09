@@ -213,6 +213,65 @@ unattended machine would otherwise suspend mid-session. No power setting is
 changed and the request ends with the process; the display may still turn off,
 and closing the lid or choosing Sleep still suspends the machine.
 
+The running health check also requires Core's block height to equal its
+header height and its best block to be less than three hours old. Equal
+heights alone do not prove synchronization: a node cut off from the network
+keeps them equal while the real chain moves on. `getblocktemplate` on the
+mining thread is limited to 60 seconds, so a node that accepts the call and
+then hangs counts as a failed call instead of idling the GPU.
+
+#### Automatic restart (optional)
+
+`--auto-restart` (mainnet only) keeps one miner running through failures that
+a fresh start can cure. It is off unless the flag is given.
+
+What is restarted:
+
+- connectivity that did not come back within `--recovery-timeout`, or Core or
+  Tor not being ready when a restart is attempted;
+- the CUDA process dying or reporting a CUDA error, for example after a GPU
+  driver reset or a resume from sleep.
+
+What is never restarted, because another attempt would not make it right or
+could do harm: a payout script mismatch, a failed wallet ownership check, an
+invalid template, any failure after a candidate was found, a rejected block, a
+submission whose outcome is unknown, an accepted block, a GPU result the CPU
+does not confirm, a failed GPU self-test, the temperature stop below, and
+Ctrl+C.
+
+A restart is a complete new session: the Tor check, chain, synchronization and
+peer checks, the pinned payout script, wallet ownership and the GPU self-test
+all run again, with a new CUDA process. Nothing is carried over, and nothing
+is written to disk, so the permission to mine ends with the process: a new
+launcher window asks for `MINE` again. The first session must pass every
+check and reach mining by itself; a restart never stands in for that.
+
+Restarts wait 30 s, 1, 2, 5 and then 10 minutes, and stop after 10 in a row.
+The count starts again only after 30 minutes of mining without a pause. Ten
+failures in a row end the miner with an error; repeated CUDA failures can mean
+an unstable GPU or driver. Ctrl+C stops at once, including during a wait.
+
+Before each session mines, a self-test compares the GPU with the CPU on 21
+fixed scans at the session's version count: an early hit, a rare hit, a range
+with no hit through the last nonce, and single nonces chosen so that each of
+the 16 version variants is the one reported. It takes well under a second.
+Any difference stops the miner for good.
+
+Only one supervised miner can run on the machine: it holds a Windows named
+mutex from before its first check until it exits, including while it waits to
+restart, and a second one exits immediately.
+
+`--max-gpu-temp <C>` (mainnet only, default off) reads the temperature with
+`nvidia-smi` on the monitor thread. Two consecutive readings at or above the
+limit stop the miner for good at the next chunk boundary, with no restart, so
+heat cannot cause a restart loop. The session also refuses to start at or
+above the limit, or if the temperature cannot be read at startup; a reading
+that fails later is ignored. The driver's own 87 C target, 97 C slowdown and
+100 C shutdown are not touched.
+
+Not covered: a crash of the Python process itself and a Windows restart end
+the miner, since the supervisor lives in that process.
+
 The block is passed to `bitcoin-cli` through `-stdin`, because a real mainnet
 block is far larger than the Windows command-line limit.
 

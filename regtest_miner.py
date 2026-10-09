@@ -60,6 +60,21 @@ VERSION_ROLL_SHIFT = 13
 VERSION_ROLL_MASK = 0xFFFF << VERSION_ROLL_SHIFT
 VERSION_ROLL_COUNT = 16
 STATUS_INTERVAL = 5.0
+# getblocktemplate is bounded so that a node which accepts the call and then
+# hangs is treated as a failed call instead of idling the GPU unnoticed.
+TEMPLATE_FETCH_TIMEOUT = 60.0
+# A best block older than this means the node has stopped hearing about new
+# blocks, even if it reports blocks == headers: both may be equally stale.
+TIP_STALE_SECONDS = 3 * 3600.0
+# --auto-restart: waits before each automatic restart, the last one repeating;
+# the number of consecutive restarts allowed; and how long a session must
+# mine without a pause before the count starts again from zero.
+RESTART_DELAYS = (30.0, 60.0, 120.0, 300.0, 600.0)
+RESTART_LIMIT = 10
+RESTART_HEALTHY_SECONDS = 1800.0
+# --max-gpu-temp: consecutive monitor polls at or above the limit that stop mining.
+GPU_HOT_POLLS_TO_STOP = 2
+SINGLE_INSTANCE_MUTEX = "Local\\BitcoinCudaSoloMiner"
 SUBMIT_TIMEOUT = 120.0
 # Waits before each further submitblock attempt after one failed without
 # Core reporting the block as known.
@@ -83,6 +98,27 @@ class RpcError(RuntimeError):
 
 class MiningPaused(Exception):
     """Connectivity loss was confirmed between chunks; no GPU work is in flight."""
+
+
+class RecoverableStop(RuntimeError):
+    """The session ended for a reason that a complete fresh start may cure.
+
+    Only these are restarted by --auto-restart. Everything else that ends a
+    session (payout, wallet, template, candidate or submission problems, a
+    GPU result the CPU does not confirm) stays a plain error and is final.
+    """
+
+
+class NodeNotReady(RecoverableStop):
+    """Bitcoin Core or Tor is unreachable, unsynchronized or without peers."""
+
+
+class CudaFailure(RecoverableStop):
+    """The CUDA process died or reported a CUDA error."""
+
+
+class ThermalStop(RuntimeError):
+    """The GPU stayed at or above --max-gpu-temp; never restarted automatically."""
 
 
 def keep_system_awake(enable: bool) -> None:
@@ -134,7 +170,7 @@ def ensure_tor_ready(
 
     print(f"[TOR] Tor not detected on {host}:{port}.")
     if executable is None:
-        raise RuntimeError(
+        raise NodeNotReady(
             "Tor SOCKS5 is unavailable and no Tor executable was configured; "
             "use --tor-executable to allow automatic startup; CUDA mining was prevented"
         )
@@ -171,7 +207,7 @@ def ensure_tor_ready(
                 return owned_process
             time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
 
-        raise RuntimeError(
+        raise NodeNotReady(
             f"Tor SOCKS5 proxy did not become ready at {host}:{port} "
             f"within {timeout:g} seconds; CUDA mining was prevented"
         )
@@ -221,7 +257,7 @@ def preflight_mainnet(
         if not isinstance(chain, dict) or chain.get("chain") != "main":
             raise RuntimeError("Bitcoin Core RPC did not confirm the main chain")
         if chain.get("initialblockdownload") is not False:
-            raise RuntimeError(
+            raise NodeNotReady(
                 "Bitcoin Core is in initial block download or did not report "
                 "initialblockdownload=false; CUDA mining was prevented"
             )
@@ -235,17 +271,20 @@ def preflight_mainnet(
             or not isinstance(headers, int)
             or blocks != headers
         ):
-            raise RuntimeError(
+            raise NodeNotReady(
                 "Bitcoin Core is not synchronized to its known header tip "
                 f"(blocks={blocks!r}, headers={headers!r}); CUDA mining was prevented"
             )
+        stale_tip = stale_tip_problem(chain)
+        if stale_tip is not None:
+            raise NodeNotReady(f"{stale_tip}; CUDA mining was prevented")
 
         network_info = rpc(cli, "mainnet", datadir, conf, "getnetworkinfo")
         if (
             not isinstance(network_info, dict)
             or network_info.get("networkactive") is not True
         ):
-            raise RuntimeError(
+            raise NodeNotReady(
                 "Bitcoin Core networking is inactive or not confirmed active; "
                 "CUDA mining was prevented"
             )
@@ -255,11 +294,11 @@ def preflight_mainnet(
             or not isinstance(connections, int)
             or connections < 1
         ):
-            raise RuntimeError(
+            raise NodeNotReady(
                 "Bitcoin Core has no connected peers; CUDA mining was prevented"
             )
         if connections < min_peers:
-            raise RuntimeError(
+            raise NodeNotReady(
                 f"Bitcoin Core has {connections} connected peer(s) but "
                 f"--min-peers requires {min_peers}; CUDA mining was prevented"
             )
@@ -276,7 +315,7 @@ def preflight_mainnet(
                 )
                 for peer in peers
             ):
-                raise RuntimeError(
+                raise NodeNotReady(
                     "Tor-only operation was required, but Bitcoin Core has no "
                     "connected onion peer; CUDA mining was prevented"
                 )
@@ -1128,6 +1167,51 @@ def rpc(
         ) from error
 
 
+def stale_tip_problem(chain: dict) -> str | None:
+    """Why the node's best block is too old to mine on, or None.
+
+    blocks == headers only shows the node has every block it knows about. A
+    node cut off from the network keeps that equality while the real chain
+    moves on, so the age of its best block is checked as well.
+    """
+    tip_time = chain.get("time")
+    if isinstance(tip_time, bool) or not isinstance(tip_time, int):
+        return None
+    age = time.time() - tip_time
+    if age <= TIP_STALE_SECONDS:
+        return None
+    return (
+        f"Bitcoin Core's best block is {age / 3600:.1f} hours old; it has "
+        "probably stopped receiving blocks"
+    )
+
+
+def gpu_temperature() -> int | None:
+    """GPU temperature in degrees C from nvidia-smi; None when it cannot be read."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=TIP_CHECK_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return int(result.stdout.split()[0])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def check_gpu_temperature(limit: int) -> None:
+    """Raise ThermalStop at or above the limit. An unreadable temperature passes:
+    the driver's own slowdown and shutdown protections are never touched."""
+    temperature = gpu_temperature()
+    if temperature is not None and temperature >= limit:
+        raise ThermalStop(
+            f"GPU temperature {temperature} C is at or above --max-gpu-temp {limit} C"
+        )
+
+
 def check_node_health(
     cli: Path,
     datadir: Path | None,
@@ -1147,6 +1231,19 @@ def check_node_health(
         raise RuntimeError("Bitcoin Core RPC did not confirm the main chain")
     if chain.get("initialblockdownload") is not False:
         raise RuntimeError("Bitcoin Core reports initial block download")
+    blocks, headers = chain.get("blocks"), chain.get("headers")
+    if (
+        isinstance(blocks, int)
+        and isinstance(headers, int)
+        and not isinstance(blocks, bool)
+        and blocks != headers
+    ):
+        raise RuntimeError(
+            f"Bitcoin Core is behind its header tip (blocks={blocks}, headers={headers})"
+        )
+    stale_tip = stale_tip_problem(chain)
+    if stale_tip is not None:
+        raise RuntimeError(stale_tip)
     network_info = rpc(cli, "mainnet", datadir, conf, "getnetworkinfo", timeout=TIP_CHECK_TIMEOUT)
     if not isinstance(network_info, dict) or network_info.get("networkactive") is not True:
         raise RuntimeError("Bitcoin Core networking is inactive")
@@ -1175,12 +1272,22 @@ class NodeMonitor:
     reason() between chunks. One failed poll is not a reason to pause.
     """
 
-    def __init__(self, check: Callable[[], None], interval: float) -> None:
+    def __init__(
+        self,
+        check: Callable[[], None],
+        interval: float,
+        thermal_check: Callable[[], None] | None = None,
+    ) -> None:
         self.check = check
         self.interval = interval
+        self.thermal_check = thermal_check
         self.lock = threading.Lock()
         self.failures = 0
         self.last_error = ""
+        # Set once the GPU has stayed too hot; the mining thread then stops
+        # for good instead of pausing, so heat cannot cause a restart loop.
+        self.hot_polls = 0
+        self.fatal: str | None = None
         self.stopped = threading.Event()
         self.thread: threading.Thread | None = None
 
@@ -1194,6 +1301,17 @@ class NodeMonitor:
             self.poll()
 
     def poll(self) -> None:
+        if self.thermal_check is not None:
+            try:
+                self.thermal_check()
+            except ThermalStop as stop:
+                with self.lock:
+                    self.hot_polls += 1
+                    if self.hot_polls >= GPU_HOT_POLLS_TO_STOP:
+                        self.fatal = str(stop)
+            else:
+                with self.lock:
+                    self.hot_polls = 0
         try:
             self.check()
         except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
@@ -1232,7 +1350,7 @@ def wait_for_recovery(check: Callable[[], None], timeout: float) -> None:
             delay = RECOVERY_DELAYS[min(attempt, len(RECOVERY_DELAYS) - 1)]
             attempt += 1
             if time.monotonic() + delay > deadline:
-                raise RuntimeError(
+                raise NodeNotReady(
                     f"Connectivity did not recover within {timeout:g} seconds "
                     f"(last check: {error}); mining stopped"
                 ) from error
@@ -1273,10 +1391,13 @@ def fetch_work(
         conf,
         "getblocktemplate",
         {"rules": ["segwit"]},
+        timeout=TEMPLATE_FETCH_TIMEOUT,
     )
     if not isinstance(template, dict):
         raise RuntimeError("getblocktemplate returned an unexpected response")
-    current_tip = rpc(cli, network, datadir, conf, "getbestblockhash")
+    current_tip = rpc(
+        cli, network, datadir, conf, "getbestblockhash", timeout=TIP_CHECK_TIMEOUT
+    )
     if template.get("previousblockhash") != current_tip:
         return None
     bits, target, nonce_start, nonce_end = validate_template(template)
@@ -1426,6 +1547,10 @@ class MiningSession:
         return False
 
     def pause_reason(self) -> str | None:
+        # Asked only between chunks, when no GPU work is in flight.
+        fatal = getattr(self.monitor, "fatal", None)
+        if isinstance(fatal, str) and fatal:
+            raise ThermalStop(fatal)
         if self.tip_failures >= TIP_CHECK_FAILURE_LIMIT:
             return (
                 f"{self.tip_failures} consecutive tip checks failed: {self.tip_error}"
@@ -1480,7 +1605,7 @@ class CudaMiner:
             )
         except OSError as error:
             self.failed = True
-            raise RuntimeError(f"Could not start CUDA miner: {error}") from error
+            raise CudaFailure(f"Could not start CUDA miner: {error}") from error
         try:
             ready = self.process.stdout.readline()
         except (OSError, ValueError) as error:
@@ -1488,7 +1613,10 @@ class CudaMiner:
         if ready != "READY\n":
             self._fail(f"CUDA process did not report READY (got {ready!r})")
 
-    def _fail(self, detail: str) -> NoReturn:
+    def _fail(self, detail: str, recoverable: bool = True) -> NoReturn:
+        """Kill the process and raise. A dead process or a CUDA error is a
+        CudaFailure; a broken request/reply sequence is not, because a fresh
+        start would not explain it."""
         process, self.process = self.process, None
         self.failed = True
         if process is not None:
@@ -1501,7 +1629,7 @@ class CudaMiner:
             detail += f"; exit status {process.returncode}"
             if diagnostics and diagnostics.strip():
                 detail += f": {diagnostics.strip()}"
-        raise RuntimeError(f"CUDA miner failed: {detail}")
+        raise (CudaFailure if recoverable else RuntimeError)(f"CUDA miner failed: {detail}")
 
     def scan(
         self, header: bytes, start: int, count: int, versions: int = 1
@@ -1518,14 +1646,17 @@ class CudaMiner:
         of the header, and a hit is reported as (nonce, hash, variant).
         """
         if self.failed:
-            raise RuntimeError(
+            raise CudaFailure(
                 "CUDA miner failed earlier in this session and was not restarted"
             )
         if self.process is None:
             self._start()
         if self.pending_id is not None:
             if not self.pending_abandoned:
-                self._fail("a scan was started before the previous result was read")
+                self._fail(
+                    "a scan was started before the previous result was read",
+                    recoverable=False,
+                )
             # Replies come back in request order, so the abandoned scan's
             # reply must be consumed before new work; it is never returned
             # as a scan result.
@@ -1559,11 +1690,11 @@ class CudaMiner:
 
     def finish_scan(self) -> tuple | None:
         if self.failed:
-            raise RuntimeError(
+            raise CudaFailure(
                 "CUDA miner failed earlier in this session and was not restarted"
             )
         if self.pending_id is None or self.pending_abandoned:
-            self._fail("no scan result is waiting to be read")
+            self._fail("no scan result is waiting to be read", recoverable=False)
         return self._read_reply()
 
     def _read_reply(self) -> tuple | None:
@@ -1600,7 +1731,7 @@ class CudaMiner:
                     and int(fields[4]) < versions
                 ):
                     return int(fields[2]), fields[3], int(fields[4])
-        self._fail(f"Unexpected CUDA miner output: {line!r}")
+        self._fail(f"Unexpected CUDA miner output: {line!r}", recoverable=False)
 
     def close(self) -> None:
         process, self.process = self.process, None
@@ -1626,6 +1757,98 @@ class CudaMiner:
                     stream.close()
                 except (OSError, ValueError):
                     pass
+
+
+def cuda_self_test(cuda_miner: CudaMiner, versions: int) -> None:
+    """Known-answer check of the scan kernel against hashlib before a session mines.
+
+    Every expectation is computed here on the CPU from the 80-byte header,
+    for the same number of version variants the session will use: windows
+    with an early hit, a rare hit and no hit (through the last nonce), and
+    single-nonce scans chosen so that each of the 16 variants in turn is the
+    one reported. Any difference raises a plain error, which nothing restarts.
+    """
+
+    def reference(header: bytes, start: int, count: int) -> tuple | None:
+        target = bits_to_target(struct.unpack("<I", header[72:76])[0])
+        for nonce in range(start, start + count):
+            for variant in range(versions):
+                digest = double_sha256(candidate_header(header, nonce, variant))
+                if int.from_bytes(digest[::-1], "big") <= target:
+                    found = (nonce, digest[::-1].hex())
+                    return found + ((variant,) if versions > 1 else ())
+        return None
+
+    def test_header(label: bytes, bits: int) -> bytes:
+        return (
+            struct.pack("<I", 0x20000000)
+            + double_sha256(b"self-test previous " + label)
+            + double_sha256(b"self-test merkle " + label)
+            + struct.pack("<II", 1_791_500_000, bits)
+            + bytes(4)
+        )
+
+    scans = [
+        (test_header(b"early hit", 0x1F7FFFFF), 0, 4096),
+        (test_header(b"rare hit", 0x1F00FFFF), 1 << 31, 2048),
+        (test_header(b"no hit", 0x1D00FFFF), 0xFFFFF800, 2048),
+    ]
+    # For this header the lowest qualifying variant at these nonces is
+    # 0, 1, ... 15 in order; at nonces 0 and 1 no variant qualifies.
+    every_variant = test_header(b"every variant", 0x200FFFFF)
+    scans.extend(
+        (every_variant, nonce, 1)
+        for nonce in (12, 10, 19, 62, 34, 23, 63, 6, 7, 45, 11, 88, 49, 15, 5, 9, 0, 1)
+    )
+    reported = set()
+    for header, start, count in scans:
+        expected = reference(header, start, count)
+        if header is every_variant and expected is not None and versions > 1:
+            reported.add(expected[2])
+        result = cuda_miner.scan(header, start, count, *((versions,) if versions > 1 else ()))
+        if result != expected:
+            raise RuntimeError(
+                "CUDA self-test failed: for nonces "
+                f"{start}..{start + count - 1} at bits {header[72:76][::-1].hex()} "
+                f"the GPU returned {result!r} but the CPU computed {expected!r}; "
+                "mining was prevented"
+            )
+    if versions == 16 and reported != set(range(16)):
+        raise RuntimeError("CUDA self-test vectors do not cover every version variant")
+    print(
+        f"[GPU] Self-test passed: {len(scans)} scans at {versions} version(s) "
+        "per nonce agree with the CPU.",
+        flush=True,
+    )
+
+
+def acquire_single_instance() -> object | None:
+    """Take the machine-wide miner mutex; None if another process already holds it.
+
+    The mutex belongs to this process, so it is released by release_single_instance
+    or, if the process dies, by Windows. Nothing is left behind on disk.
+    """
+    if sys.platform != "win32":
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
+    if not handle:
+        raise RuntimeError("Could not create the single-instance mutex")
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        release_single_instance(handle)
+        return None
+    return handle
+
+
+def release_single_instance(handle: object | None) -> None:
+    if sys.platform != "win32" or not isinstance(handle, int):
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle(handle)
 
 
 def start_chunk(
@@ -2473,11 +2696,312 @@ def parse_args() -> argparse.Namespace:
             "found this way carries the rolled version"
         ),
     )
+    parser.add_argument(
+        "--auto-restart",
+        action="store_true",
+        help=(
+            "Mainnet only: after lost connectivity or a CUDA failure, start "
+            f"again with every startup check, at most {RESTART_LIMIT} times in "
+            "a row; also runs a GPU self-test against the CPU before mining "
+            "and refuses to run beside another supervised miner"
+        ),
+    )
+    parser.add_argument(
+        "--max-gpu-temp",
+        type=int,
+        default=0,
+        metavar="CELSIUS",
+        help=(
+            "Mainnet only: stop for good, without a restart, when the GPU "
+            "stays at or above this temperature (default: 0, no limit)"
+        ),
+    )
     return parser.parse_args()
+
+
+@dataclass
+class SessionProgress:
+    """What a session tells the supervisor: since when it has mined without a pause."""
+
+    mining_since: float | None = None
+
+    def healthy_seconds(self) -> float:
+        if self.mining_since is None:
+            return 0.0
+        return time.monotonic() - self.mining_since
+
+
+def mining_session(
+    args: argparse.Namespace,
+    expected_payout_script: bytes | None,
+    progress: SessionProgress | None = None,
+) -> int:
+    """One complete run: every startup check, then mining until it ends or fails.
+
+    Raises instead of reporting; main and supervise decide what an error means.
+    """
+    owned_tor: subprocess.Popen[bytes] | None = None
+    session: MiningSession | None = None
+    cuda_miner = CudaMiner(args.cuda_miner)
+
+    def health_check() -> None:
+        check_node_health(
+            args.bitcoin_cli,
+            args.datadir,
+            args.bitcoin_conf,
+            args.tor_host,
+            args.tor_port,
+            args.min_peers,
+            args.require_onion_peers,
+        )
+
+    try:
+        if args.network == "mainnet":
+            keep_system_awake(True)
+            print("NETWORK: MAINNET")
+            if args.live_mainnet:
+                print("MODE: LIVE (valid blocks WILL be submitted with submitblock)")
+            else:
+                print("MODE: DRY RUN (submitblock is never called)")
+            try:
+                owned_tor = preflight_mainnet(
+                    args.bitcoin_cli,
+                    args.datadir,
+                    args.bitcoin_conf,
+                    args.tor_host,
+                    args.tor_port,
+                    args.tor_executable,
+                    args.tor_startup_timeout,
+                    args.tor_poll_interval,
+                    args.require_onion_peers,
+                    args.min_peers,
+                )
+            except RpcError as error:
+                # Core did not answer at all: a readiness problem, unlike an
+                # answer that fails a check.
+                raise NodeNotReady(str(error)) from error
+            payout_script = resolve_payout_script(
+                args.bitcoin_cli,
+                args.datadir,
+                args.bitcoin_conf,
+                args.payout_address,
+                expected_payout_script,
+            )
+            if args.live_mainnet:
+                if expected_payout_script is None or payout_script != expected_payout_script:
+                    raise RuntimeError(
+                        "Live mainnet requires a pinned payout script that "
+                        "matches Bitcoin Core; CUDA mining was prevented"
+                    )
+                verify_wallet_ownership(
+                    args.bitcoin_cli,
+                    args.datadir,
+                    args.bitcoin_conf,
+                    args.payout_address,
+                    payout_script,
+                )
+                print_live_preflight_summary(
+                    args.payout_address,
+                    payout_script,
+                    expected_payout_script,
+                )
+            thermal_check = None
+            if args.max_gpu_temp:
+                if gpu_temperature() is None:
+                    raise RuntimeError(
+                        "--max-gpu-temp was given but nvidia-smi did not report "
+                        "the GPU temperature; CUDA mining was prevented"
+                    )
+
+                def thermal_check() -> None:
+                    check_gpu_temperature(args.max_gpu_temp)
+
+                thermal_check()
+            if args.auto_restart:
+                cuda_self_test(
+                    cuda_miner, VERSION_ROLL_COUNT if args.version_rolling else 1
+                )
+            session = MiningSession(
+                args.bitcoin_cli,
+                args.datadir,
+                args.bitcoin_conf,
+                NodeMonitor(health_check, args.monitor_interval, thermal_check),
+                TemplatePrefetcher(
+                    lambda: fetch_work(
+                        args.bitcoin_cli, "mainnet", args.datadir, args.bitcoin_conf
+                    )
+                ),
+            )
+            session.monitor.start()
+        else:
+            chain = rpc(
+                args.bitcoin_cli,
+                args.network,
+                args.datadir,
+                args.bitcoin_conf,
+                "getblockchaininfo",
+            )
+            if not isinstance(chain, dict) or chain.get("chain") != "regtest":
+                raise RuntimeError(
+                    "Bitcoin Core RPC did not confirm the regtest chain; the "
+                    "anyone-can-spend regtest payout was refused"
+                )
+            payout_script = REGTEST_PAYOUT_SCRIPT
+
+        mined = 0
+        extra_nonce = 0
+        if progress is not None:
+            progress.mining_since = time.monotonic()
+        while args.dry_run or args.blocks == 0 or mined < args.blocks:
+            try:
+                block_mined = mine_one_block(
+                    args.bitcoin_cli,
+                    cuda_miner,
+                    args.network,
+                    args.datadir,
+                    args.bitcoin_conf,
+                    args.chunk_size,
+                    extra_nonce,
+                    payout_script,
+                    dry_run=args.dry_run,
+                    live_mainnet=args.live_mainnet,
+                    payout_address=args.payout_address,
+                    session=session,
+                    **({"version_rolling": True} if args.version_rolling else {}),
+                )
+            except (MiningPaused, RpcError) as pause:
+                # Regtest keeps failing fast; on mainnet no candidate is
+                # pending here and no GPU work is in flight.
+                if session is None:
+                    raise
+                print(f"[MONITOR] Mining paused: {pause}", flush=True)
+                wait_for_recovery(health_check, args.recovery_timeout)
+                session.reset()
+                print(
+                    "[MONITOR] Bitcoin Core and Tor answer again; resuming "
+                    "with a fresh template.",
+                    flush=True,
+                )
+                extra_nonce += 1
+                # A pause is not healthy mining: the clock starts again.
+                if progress is not None:
+                    progress.mining_since = time.monotonic()
+                continue
+            if block_mined:
+                mined += 1
+                extra_nonce = 0
+                if args.network == "mainnet":
+                    print(
+                        "Mining stopped after the accepted mainnet block; "
+                        "inspect the result before restarting."
+                    )
+                    break
+            else:
+                extra_nonce += 1
+        if session is not None and session.accepted_block is not None:
+            # Mining is over; free the GPU and watch the block mature.
+            cuda_miner.close()
+            session.close()
+            return monitor_block(
+                args.bitcoin_cli,
+                "mainnet",
+                args.datadir,
+                args.bitcoin_conf,
+                session.accepted_block,
+            )
+        return 0
+    finally:
+        try:
+            cuda_miner.close()
+        finally:
+            if session is not None:
+                session.close()
+            stop_owned_tor(owned_tor)
+            keep_system_awake(False)
+
+
+
+def supervise(args: argparse.Namespace, expected_payout_script: bytes | None) -> int:
+    """--auto-restart: run sessions until one ends for a reason that is final.
+
+    Only a RecoverableStop is restarted, and a restart is a whole new session:
+    Tor, chain, synchronization, peers, the pinned payout script, wallet
+    ownership and the GPU self-test are all checked again before any work.
+    The first session must get as far as mining, so a restart never stands in
+    for the checks made when the operator started the miner. Restarts are
+    limited to RESTART_LIMIT in a row; RESTART_HEALTHY_SECONDS of mining
+    without a pause starts the count again. Nothing is remembered outside
+    this process, and the single-instance mutex is held throughout.
+    """
+    lock = acquire_single_instance()
+    if lock is None:
+        print(
+            "Another supervised miner is already running on this machine; "
+            "this one was not started.",
+            file=sys.stderr,
+        )
+        return 1
+    failures = 0
+    has_mined = False
+    try:
+        while True:
+            progress = SessionProgress()
+            try:
+                return mining_session(args, expected_payout_script, progress)
+            except RecoverableStop as stop:
+                reason = stop
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                print(f"Mainnet miner stopped: {error}", file=sys.stderr)
+                print(
+                    "[SUPERVISOR] This kind of failure is never restarted "
+                    "automatically.",
+                    file=sys.stderr,
+                )
+                return 1
+            has_mined = has_mined or progress.mining_since is not None
+            if not has_mined:
+                print(f"Mainnet miner stopped: {reason}", file=sys.stderr)
+                print(
+                    "[SUPERVISOR] The first start did not pass its checks, so "
+                    "there is nothing to restart.",
+                    file=sys.stderr,
+                )
+                return 1
+            if progress.healthy_seconds() >= RESTART_HEALTHY_SECONDS:
+                failures = 0
+            failures += 1
+            if failures > RESTART_LIMIT:
+                print(f"Mainnet miner stopped: {reason}", file=sys.stderr)
+                print(
+                    f"[SUPERVISOR] {RESTART_LIMIT} restarts in a row did not "
+                    "give a healthy session; stopping. Repeated CUDA failures "
+                    "can mean an unstable GPU or driver.",
+                    file=sys.stderr,
+                )
+                return 1
+            delay = RESTART_DELAYS[min(failures, len(RESTART_DELAYS)) - 1]
+            print(
+                f"[SUPERVISOR] Session ended: {reason}\n"
+                f"[SUPERVISOR] Restart {failures} of {RESTART_LIMIT} in "
+                f"{delay:g} s, with every startup check (Ctrl+C stops).",
+                flush=True,
+            )
+            # The session released the idle-sleep request when it ended.
+            keep_system_awake(True)
+            time.sleep(delay)
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+        return 130
+    finally:
+        keep_system_awake(False)
+        release_single_instance(lock)
 
 
 def main() -> int:
     args = parse_args()
+    # A namespace built without the newer options behaves as if they were off.
+    args.auto_restart = getattr(args, "auto_restart", False)
+    args.max_gpu_temp = getattr(args, "max_gpu_temp", 0)
     if args.monitor_block is not None:
         block_hash = args.monitor_block.lower()
         if len(block_hash) != 64 or HEX_PATTERN.match(block_hash) is None:
@@ -2519,6 +3043,12 @@ def main() -> int:
         return 2
     if args.blocks < 0:
         print("--blocks must be nonnegative", file=sys.stderr)
+        return 2
+    if (args.auto_restart or args.max_gpu_temp) and args.network != "mainnet":
+        print("--auto-restart and --max-gpu-temp require --mainnet", file=sys.stderr)
+        return 2
+    if args.max_gpu_temp and not 50 <= args.max_gpu_temp <= 105:
+        print("--max-gpu-temp must be from 50 through 105, or 0 for no limit", file=sys.stderr)
         return 2
     if not 1 <= args.chunk_size <= 0xFFFFFFFF:
         print("--chunk-size must be from 1 through 4294967295", file=sys.stderr)
@@ -2596,150 +3126,10 @@ def main() -> int:
         )
         return 2
 
-    owned_tor: subprocess.Popen[bytes] | None = None
-    session: MiningSession | None = None
-    cuda_miner = CudaMiner(args.cuda_miner)
-
-    def health_check() -> None:
-        check_node_health(
-            args.bitcoin_cli,
-            args.datadir,
-            args.bitcoin_conf,
-            args.tor_host,
-            args.tor_port,
-            args.min_peers,
-            args.require_onion_peers,
-        )
-
+    if args.auto_restart:
+        return supervise(args, expected_payout_script)
     try:
-        if args.network == "mainnet":
-            keep_system_awake(True)
-            print("NETWORK: MAINNET")
-            if args.live_mainnet:
-                print("MODE: LIVE (valid blocks WILL be submitted with submitblock)")
-            else:
-                print("MODE: DRY RUN (submitblock is never called)")
-            owned_tor = preflight_mainnet(
-                args.bitcoin_cli,
-                args.datadir,
-                args.bitcoin_conf,
-                args.tor_host,
-                args.tor_port,
-                args.tor_executable,
-                args.tor_startup_timeout,
-                args.tor_poll_interval,
-                args.require_onion_peers,
-                args.min_peers,
-            )
-            payout_script = resolve_payout_script(
-                args.bitcoin_cli,
-                args.datadir,
-                args.bitcoin_conf,
-                args.payout_address,
-                expected_payout_script,
-            )
-            if args.live_mainnet:
-                if expected_payout_script is None or payout_script != expected_payout_script:
-                    raise RuntimeError(
-                        "Live mainnet requires a pinned payout script that "
-                        "matches Bitcoin Core; CUDA mining was prevented"
-                    )
-                verify_wallet_ownership(
-                    args.bitcoin_cli,
-                    args.datadir,
-                    args.bitcoin_conf,
-                    args.payout_address,
-                    payout_script,
-                )
-                print_live_preflight_summary(
-                    args.payout_address,
-                    payout_script,
-                    expected_payout_script,
-                )
-            session = MiningSession(
-                args.bitcoin_cli,
-                args.datadir,
-                args.bitcoin_conf,
-                NodeMonitor(health_check, args.monitor_interval),
-                TemplatePrefetcher(
-                    lambda: fetch_work(
-                        args.bitcoin_cli, "mainnet", args.datadir, args.bitcoin_conf
-                    )
-                ),
-            )
-            session.monitor.start()
-        else:
-            chain = rpc(
-                args.bitcoin_cli,
-                args.network,
-                args.datadir,
-                args.bitcoin_conf,
-                "getblockchaininfo",
-            )
-            if not isinstance(chain, dict) or chain.get("chain") != "regtest":
-                raise RuntimeError(
-                    "Bitcoin Core RPC did not confirm the regtest chain; the "
-                    "anyone-can-spend regtest payout was refused"
-                )
-            payout_script = REGTEST_PAYOUT_SCRIPT
-
-        mined = 0
-        extra_nonce = 0
-        while args.dry_run or args.blocks == 0 or mined < args.blocks:
-            try:
-                block_mined = mine_one_block(
-                    args.bitcoin_cli,
-                    cuda_miner,
-                    args.network,
-                    args.datadir,
-                    args.bitcoin_conf,
-                    args.chunk_size,
-                    extra_nonce,
-                    payout_script,
-                    dry_run=args.dry_run,
-                    live_mainnet=args.live_mainnet,
-                    payout_address=args.payout_address,
-                    session=session,
-                    **({"version_rolling": True} if args.version_rolling else {}),
-                )
-            except (MiningPaused, RpcError) as pause:
-                # Regtest keeps failing fast; on mainnet no candidate is
-                # pending here and no GPU work is in flight.
-                if session is None:
-                    raise
-                print(f"[MONITOR] Mining paused: {pause}", flush=True)
-                wait_for_recovery(health_check, args.recovery_timeout)
-                session.reset()
-                print(
-                    "[MONITOR] Bitcoin Core and Tor answer again; resuming "
-                    "with a fresh template.",
-                    flush=True,
-                )
-                extra_nonce += 1
-                continue
-            if block_mined:
-                mined += 1
-                extra_nonce = 0
-                if args.network == "mainnet":
-                    print(
-                        "Mining stopped after the accepted mainnet block; "
-                        "inspect the result before restarting."
-                    )
-                    break
-            else:
-                extra_nonce += 1
-        if session is not None and session.accepted_block is not None:
-            # Mining is over; free the GPU and watch the block mature.
-            cuda_miner.close()
-            session.close()
-            return monitor_block(
-                args.bitcoin_cli,
-                "mainnet",
-                args.datadir,
-                args.bitcoin_conf,
-                session.accepted_block,
-            )
-        return 0
+        return mining_session(args, expected_payout_script)
     except KeyboardInterrupt:
         print("\nStopped by user.")
         return 130
@@ -2747,14 +3137,6 @@ def main() -> int:
         prefix = "Mainnet miner stopped: " if args.network == "mainnet" else ""
         print(f"{prefix}{error}", file=sys.stderr)
         return 1
-    finally:
-        try:
-            cuda_miner.close()
-        finally:
-            if session is not None:
-                session.close()
-            stop_owned_tor(owned_tor)
-            keep_system_awake(False)
 
 
 if __name__ == "__main__":
