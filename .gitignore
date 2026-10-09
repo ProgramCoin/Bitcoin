@@ -21,3 +21,6 @@ gpu_test.exe
 # Local launcher (holds the payout address) and validation logs
 start_mining.bat
 validation_logs/
+
+# Local data exports
+bitcoin_nonces_2000.csv
